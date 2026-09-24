@@ -29,12 +29,11 @@ final class SentinelClientFactory
     ) {}
 
     /**
-     * Open a connection to a single sentinel.
+     * A client for a single sentinel. It connects lazily, on its first command.
      *
      * @param  array<string, mixed>  $config
-     * @return object A RedisSentinel (or, in tests, a stand-in) answering getMasterAddrByName().
      */
-    public function make(string $host, int $port, array $config): object
+    public function make(string $host, int $port, array $config): RedisSentinel
     {
         return new RedisSentinel($this->options($host, $port, $config));
     }
@@ -61,12 +60,18 @@ final class SentinelClientFactory
      * @param  array<string, mixed>  $config
      * @return array{host: string, port: int, connectTimeout: float, readTimeout: float, auth?: string|array{0: string, 1: string}}
      *
-     * @throws RuntimeException When only one half of the sentinel credentials is configured.
+     * @throws RuntimeException When only one half of the sentinel credentials is configured, or a sentinel
+     *                          setting is not a scalar.
      */
     public function options(string $host, int $port, array $config): array
     {
         $timeout = $config['sentinel_timeout'] ?? 0.5;
-        $timeout = is_scalar($timeout) ? (float) $timeout : 0.5;
+
+        if (! is_scalar($timeout)) {
+            throw new RuntimeException(sprintf('sentinel_timeout must be a number, %s given.', get_debug_type($timeout)));
+        }
+
+        $timeout = (float) $timeout;
 
         $options = [
             'host' => $host,
@@ -75,10 +80,8 @@ final class SentinelClientFactory
             'readTimeout' => $timeout,
         ];
 
-        $username = $config['sentinel_username'] ?? '';
-        $username = trim(is_scalar($username) ? (string) $username : '');
-        $password = $config['sentinel_password'] ?? '';
-        $password = trim(is_scalar($password) ? (string) $password : '');
+        $username = trim($this->stringSetting($config, 'sentinel_username'));
+        $password = trim($this->stringSetting($config, 'sentinel_password'));
 
         if ($username !== '' && $password === '') {
             throw new RuntimeException(
@@ -93,5 +96,23 @@ final class SentinelClientFactory
         }
 
         return $options;
+    }
+
+    /**
+     * A string setting, cast as before; anything that is not a scalar is refused rather than dropped.
+     *
+     * @param  array<string, mixed>  $config
+     *
+     * @throws RuntimeException When the setting is not a scalar.
+     */
+    private function stringSetting(array $config, string $key): string
+    {
+        $value = $config[$key] ?? '';
+
+        if (! is_scalar($value)) {
+            throw new RuntimeException(sprintf('%s must be a string, %s given.', $key, get_debug_type($value)));
+        }
+
+        return (string) $value;
     }
 }

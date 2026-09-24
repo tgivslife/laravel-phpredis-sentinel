@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Discovery;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use RedisSentinel;
 use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Discovery\SentinelClientFactory;
 
@@ -22,6 +24,11 @@ final class SentinelClientFactoryTest extends TestCase
         parent::setUp();
 
         $this->factory = new SentinelClientFactory;
+    }
+
+    public function test_make_builds_a_client_for_one_sentinel_without_connecting(): void
+    {
+        $this->assertInstanceOf(RedisSentinel::class, $this->factory->make('192.0.2.1', 26379, []));
     }
 
     public function test_the_host_list_uses_the_sentinel_default_port(): void
@@ -69,5 +76,29 @@ final class SentinelClientFactoryTest extends TestCase
         $this->expectExceptionObject(new RuntimeException('sentinel_username is set without sentinel_password - set both, or neither.'));
 
         $this->factory->options('s1', 26379, ['sentinel_username' => 'ops']);
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    #[DataProvider('nonScalarSettings')]
+    public function test_a_setting_that_is_not_a_scalar_is_refused_rather_than_dropped(array $config, string $message): void
+    {
+        // Falling back instead would turn a malformed password into an anonymous connection.
+        $this->expectExceptionObject(new RuntimeException($message));
+
+        $this->factory->options('s1', 26379, $config);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, string}>
+     */
+    public static function nonScalarSettings(): array
+    {
+        return [
+            'password' => [['sentinel_password' => ['secret']], 'sentinel_password must be a string, array given.'],
+            'username' => [['sentinel_username' => ['ops'], 'sentinel_password' => 'secret'], 'sentinel_username must be a string, array given.'],
+            'timeout' => [['sentinel_timeout' => [1]], 'sentinel_timeout must be a number, array given.'],
+        ];
     }
 }
