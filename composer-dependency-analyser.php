@@ -3,7 +3,6 @@
 declare(strict_types=1);
 
 use ShipMonk\ComposerDependencyAnalyser\Config\Configuration;
-use ShipMonk\ComposerDependencyAnalyser\Config\ErrorType;
 
 /*
  * Run against a runtime-only graph, as the "dependencies" CI job does: remove
@@ -15,6 +14,4 @@ use ShipMonk\ComposerDependencyAnalyser\Config\ErrorType;
  */
 return (new Configuration)
     ->disableComposerAutoloadPathScan()
-    ->addPathToScan(__DIR__.'/src', isDev: false)
-    // Declared up front by the plan; the extracted connector will use \Redis directly.
-    ->ignoreErrorsOnExtension('ext-redis', [ErrorType::UNUSED_DEPENDENCY]);
+    ->addPathToScan(__DIR__.'/src', isDev: false);
