@@ -473,6 +473,43 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         }
     }
 
+    /**
+     * A sentinel that answers after the deadline has passed may name a perfectly good master, but building a client
+     * from it could only overrun: nothing is connected to, and the late answer is not cached.
+     */
+    public function test_a_sentinel_answer_that_arrives_after_the_deadline_builds_no_client(): void
+    {
+        $config = $this->config('late:26379,next:26379', ['retry_deadline' => 40]);
+
+        $connector = $this->connector([
+            'late:26379' => function (): array {
+                $this->clock->advance(60);
+
+                return ['10.0.0.9', '6380'];
+            },
+            'next:26379' => static fn (): array => ['10.0.0.2', '6381'],
+        ]);
+
+        try {
+            $connector->connect($config, []);
+            $this->fail('Expected the late answer to end the connect.');
+        } catch (SentinelFailoverException $exception) {
+            $discovery = $exception->getPrevious()?->getMessage() ?? '';
+
+            $this->assertSame([], $this->clientHosts, 'no data-node client may be built from a late answer');
+            $this->assertSame(1, $this->discoveries, 'no probe starts after a late answer');
+            $this->assertStringContainsString('late:26379 (answered after the recovery deadline was spent)', $discovery);
+            $this->assertStringContainsString('next:26379 (not tried', $discovery);
+        }
+
+        // The late answer was not cached: the next connect asks the sentinels again.
+        $this->forgetRecordings();
+        $this->connector(['late:26379' => static fn (): array => ['10.0.0.2', '6381']])->connect($config, []);
+
+        $this->assertSame(1, $this->discoveries);
+        $this->assertSame(['10.0.0.2:6381'], $this->clientHosts);
+    }
+
     public function test_a_fast_sentinel_failure_still_lets_the_next_sentinel_be_tried_under_a_deadline(): void
     {
         $connector = $this->connector([

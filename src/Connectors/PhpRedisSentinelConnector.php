@@ -267,6 +267,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             }
 
             $answered = true;
+
+            // A late answer may name a good master, but a client built from it could only overrun the deadline.
+            if ($deadline?->spent()) {
+                $failures[] = "{$host}:{$port} (answered after the recovery deadline was spent)";
+
+                continue;
+            }
+
             $master = self::usableAddress($address);
 
             if ($master === null) {
