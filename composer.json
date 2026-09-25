@@ -25,7 +25,8 @@
         "php": "^8.3",
         "ext-ctype": "*",
         "ext-redis": "^6.3",
-        "illuminate/support": "^13.0",
+        "illuminate/redis": "^13.33",
+        "illuminate/support": "^13.33",
         "psr/log": "^1.0 || ^2.0 || ^3.0"
     },
     "require-dev": {

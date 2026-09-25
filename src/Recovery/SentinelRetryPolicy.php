@@ -116,10 +116,12 @@ final class SentinelRetryPolicy
      * Both callables receive the recovery deadline (null when unbounded) to clamp their socket waits to.
      * A rediscovery that spends the deadline ends the loop: the attempt it prepared could only overrun.
      *
-     * @param  callable(?RecoveryDeadline): mixed  $operation  The client operation.
+     * @template TResult
+     *
+     * @param  callable(?RecoveryDeadline): TResult  $operation  The client operation.
      * @param  callable(?RecoveryDeadline): void  $onRetry  Runs between attempts; forced rediscovery lives here.
      * @param  string  $context  Names the caller in the log lines and the give-up message.
-     * @return mixed The first successful result.
+     * @return TResult The first successful result.
      *
      * @throws SentinelFailoverException When the attempt budget or the deadline is spent.
      * @throws Throwable Anything that is not failover-class, propagated untouched.
