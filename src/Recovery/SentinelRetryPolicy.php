@@ -9,6 +9,8 @@ use Illuminate\Support\Str;
 use Psr\Log\LoggerInterface;
 use RedisException;
 use RuntimeException;
+use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
+use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Throwable;
@@ -16,9 +18,9 @@ use Throwable;
 /**
  * The failover retry budget, and the one definition of what "the master moved" looks like.
  *
- * `PhpRedisSentinelConnector` runs opening a connection through it and `PhpRedisSentinelConnection` every command.
- * Opening needs it too: php-fpm rebuilds every connection per request, so a request that arrives during an
- * election fails while connecting and never reaches the command loop.
+ * {@see PhpRedisSentinelConnector} runs opening a connection through it and {@see PhpRedisSentinelConnection} every command.
+ * Opening needs it too: php-fpm rebuilds every connection per request, so a request that arrives during an election
+ * fails while connecting and never reaches the command loop.
  *
  * `attempts` caps the re-runs and `deadlineMs` the wall clock. The deadline is the bound that matters, since one
  * attempt against a dead master can cost a connect timeout, a read timeout, phpredis' own retries and a sweep of
