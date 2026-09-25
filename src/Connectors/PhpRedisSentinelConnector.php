@@ -130,7 +130,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
             try {
                 if ($refresh) {
-                    $this->assertMaster($client, $host, $port);
+                    $this->assertMaster($client, $host, $port, $deadline);
                 }
             } finally {
                 if ($deadline !== null) {
@@ -194,11 +194,21 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * Only on rediscovery, so the happy path costs nothing: sentinels switch before the old master finishes demoting,
      * and a replica answers reads, so the mistake would otherwise stay hidden until the next write.
      *
-     * @throws SentinelDiscoveryException Retryable: the promotion has not landed yet.
+     * No check starts once the deadline is spent: INFO is a round trip the budget cannot cover, and an unverified
+     * node is refused rather than handed out as the master.
+     *
+     * @throws SentinelDiscoveryException Retryable: the promotion has not landed yet, or was not checked in time.
      */
-    private function assertMaster(Redis $client, string $host, int $port): void
+    private function assertMaster(Redis $client, string $host, int $port, ?RecoveryDeadline $deadline): void
     {
         $node = "{$host}:{$port}";
+
+        if ($deadline?->spent()) {
+            throw new SentinelDiscoveryException(
+                "The recovery deadline was spent before the role of [{$node}] could be verified",
+                anySentinelAnswered: true,
+            );
+        }
 
         try {
             $info = $client->info('replication');

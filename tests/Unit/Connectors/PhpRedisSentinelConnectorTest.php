@@ -58,6 +58,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
      * @param  list<string>  $replicaHosts  Hosts that report role:slave.
      * @param  list<string>  $noInfoHosts  Hosts whose INFO returns false instead of an array.
      * @param  list<string>  $infoErrorHosts  Hosts whose INFO throws.
+     * @param  array<string, int>  $buildMs  host => how far building its client moves the clock.
      */
     private function connector(
         array $sentinels,
@@ -66,6 +67,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         int $deadConnectMs = 0,
         array $noInfoHosts = [],
         array $infoErrorHosts = [],
+        array $buildMs = [],
     ): PhpRedisSentinelConnector {
         $sentinelClient = function (string $host, int $port, array $config) use ($sentinels): RedisSentinel {
             $this->discoveries++;
@@ -86,10 +88,11 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         };
 
         $dataClient = function (array $config) use (
-            $deadMasters, $replicaHosts, $deadConnectMs, $noInfoHosts, $infoErrorHosts,
+            $deadMasters, $replicaHosts, $deadConnectMs, $noInfoHosts, $infoErrorHosts, $buildMs,
         ): Redis {
             $this->clientHosts[] = "{$config['host']}:{$config['port']}";
             $this->clientConfigs[] = $config;
+            $this->clock->advance($buildMs[$config['host']] ?? 0);
 
             if (in_array($config['host'], $deadMasters, true)) {
                 $this->clock->advance($deadConnectMs);
@@ -109,6 +112,8 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 /** @var list<float> Every value OPT_READ_TIMEOUT was set to, in order. */
                 public array $readTimeouts = [];
 
+                public int $infoCalls = 0;
+
                 public function __construct(private readonly ?string $role) {}
 
                 /**
@@ -116,6 +121,8 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                  */
                 public function info(string ...$sections): array|false
                 {
+                    $this->infoCalls++;
+
                     if ($this->role === 'error') {
                         throw new RedisException('ERR the INFO reply could not be read');
                     }
@@ -433,6 +440,37 @@ final class PhpRedisSentinelConnectorTest extends TestCase
 
         $this->assertSame(['mymaster'], $asked);
         $this->assertSame([0.5], $this->sentinelTimeouts, 'a 0.5 s probe fits the 5 s default deadline unclamped');
+    }
+
+    /**
+     * A rediscovery whose client setup spends the rest of the budget starts no role check: INFO is one more round
+     * trip the deadline cannot cover, and an unverified node must not be handed out as the master either.
+     */
+    public function test_a_rediscovery_whose_setup_spends_the_budget_starts_no_role_check(): void
+    {
+        $config = $this->config('s1:26379', ['retry_deadline' => 100]);
+
+        // A connection before the failover caches 10.0.0.7; it then dies, and setting up 10.0.0.9 takes 150 ms.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+        $this->forgetRecordings();
+
+        $connector = $this->connector(
+            ['s1:26379' => static fn (): array => ['10.0.0.9', '6380']],
+            deadMasters: ['10.0.0.7'],
+            buildMs: ['10.0.0.9' => 150],
+        );
+
+        try {
+            $connector->connect($config, []);
+            $this->fail('Expected the spent budget to end the connect.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame(['10.0.0.7:6380', '10.0.0.9:6380'], $this->clientHosts);
+            $this->assertSame(0, $this->clients[0]->infoCalls, 'no role check may start on a spent budget');
+            $this->assertStringContainsString(
+                'spent before the role of [10.0.0.9:6380] could be verified',
+                $exception->getPrevious()?->getMessage() ?? '',
+            );
+        }
     }
 
     public function test_the_role_check_stays_off_the_happy_path(): void
