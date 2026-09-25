@@ -10,15 +10,16 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
 final class SystemClockTest extends TestCase
 {
     /**
-     * Only a lower bound: a sleep may overshoot on a busy host, never undershoot.
+     * Checks the units (milliseconds in, nanoseconds out), not precision: half the sleep is enough, because on Windows
+     * usleep() can return up to about a millisecond early when another process has raised the timer resolution.
      */
-    public function test_sleeping_moves_the_clock_forward_by_at_least_the_time_slept(): void
+    public function test_sleeping_moves_the_clock_forward_in_nanoseconds(): void
     {
         $clock = new SystemClock;
         $before = $clock->now();
 
-        $clock->sleep(1);
+        $clock->sleep(20);
 
-        $this->assertGreaterThanOrEqual(1_000_000, $clock->now() - $before);
+        $this->assertGreaterThanOrEqual(10_000_000, $clock->now() - $before);
     }
 }
