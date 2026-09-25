@@ -21,16 +21,20 @@ final readonly class RecoveryDeadline
     private const float MINIMUM_TIMEOUT_SECONDS = 0.001;
 
     /**
-     * @param  int  $at  Nanoseconds on the hrtime() clock.
+     * @param  MonotonicClock  $clock  The clock every reading of what is left is taken from.
+     * @param  int  $at  Nanoseconds on that clock.
      */
-    public function __construct(private int $at) {}
+    public function __construct(private MonotonicClock $clock, private int $at) {}
 
     /**
-     * A deadline the given number of milliseconds after an hrtime() instant.
+     * A deadline the given number of milliseconds after an instant read from the clock.
+     *
+     * @param  int  $startedAtNs  A reading of $clock itself; an instant from another clock (hrtime() beside a stand-in)
+     *                            puts the deadline anywhere.
      */
-    public static function after(int $startedAtNs, int $milliseconds): self
+    public static function after(MonotonicClock $clock, int $startedAtNs, int $milliseconds): self
     {
-        return new self($startedAtNs + $milliseconds * 1_000_000);
+        return new self($clock, $startedAtNs + $milliseconds * 1_000_000);
     }
 
     /**
@@ -41,12 +45,12 @@ final readonly class RecoveryDeadline
      */
     public function remainingMs(): int
     {
-        return max(0, intdiv($this->at - (int) hrtime(true), 1_000_000));
+        return max(0, intdiv($this->at - $this->clock->now(), 1_000_000));
     }
 
     public function spent(): bool
     {
-        return (int) hrtime(true) >= $this->at;
+        return $this->clock->now() >= $this->at;
     }
 
     /**
@@ -58,7 +62,7 @@ final readonly class RecoveryDeadline
      */
     public function clamp(float $configuredSeconds): float
     {
-        $remainingSeconds = max($this->at - (int) hrtime(true), 0) / 1_000_000_000;
+        $remainingSeconds = max($this->at - $this->clock->now(), 0) / 1_000_000_000;
 
         $clamped = $configuredSeconds > 0 ? min($configuredSeconds, $remainingSeconds) : $remainingSeconds;
 
