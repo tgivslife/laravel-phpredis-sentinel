@@ -248,6 +248,94 @@ final class SentinelRetryPolicyTest extends TestCase
     }
 
     /**
+     * A blocking command's wait is not recovery: a failover 4.5 s into a healthy 5 s wait still gets its retries,
+     * where counting the wait would leave the 5 s budget spent before recovery began.
+     */
+    public function test_a_failure_during_an_expected_wait_does_not_spend_the_recovery_budget(): void
+    {
+        $operations = 0;
+        $rediscoveries = 0;
+
+        $result = $this->policy(3, 500, 5000)->run(
+            function () use (&$operations): string {
+                if (++$operations === 1) {
+                    $this->clock->advance(4500);
+
+                    throw new RedisException('read error on connection to 10.0.0.9:6380');
+                }
+
+                return 'popped';
+            },
+            function () use (&$rediscoveries): void {
+                $rediscoveries++;
+            },
+            'test',
+            expectedWaitMs: 5000,
+        );
+
+        $this->assertSame('popped', $result);
+        $this->assertSame(1, $rediscoveries);
+    }
+
+    /**
+     * Each attempt's deadline is extended by its expected wait; the rediscovery and the attempts after it keep only
+     * what the attempt actually took, here nothing, since the clock did not move.
+     */
+    public function test_each_attempt_gets_the_deadline_extended_by_its_expected_wait(): void
+    {
+        $remaining = [];
+        $calls = 0;
+
+        $this->policy(3, 0, 5000)->run(
+            function (?RecoveryDeadline $deadline) use (&$remaining, &$calls): string {
+                $remaining[] = $deadline?->remainingMs();
+
+                if (++$calls === 1) {
+                    throw new RedisException('Connection lost');
+                }
+
+                return 'popped';
+            },
+            function (?RecoveryDeadline $deadline) use (&$remaining): void {
+                $remaining[] = $deadline?->remainingMs();
+            },
+            'test',
+            expectedWaitMs: 2000,
+        );
+
+        $this->assertSame([7000, 5000, 7000], $remaining, 'attempt, rediscovery, next attempt');
+    }
+
+    /**
+     * Credit is for time actually spent waiting. An outage where every attempt fails on a 2 s connect and every
+     * rediscovery takes 2 s never waits, so a blocking command gives up as soon as the budget allows, not one
+     * expected wait later per attempt.
+     */
+    public function test_an_attempt_that_fails_without_waiting_gets_no_more_credit_than_it_spent(): void
+    {
+        $operations = 0;
+
+        try {
+            $this->policy(3, 500, 5000)->run(
+                function () use (&$operations): void {
+                    $operations++;
+                    $this->clock->advance(2000);
+
+                    throw new RedisException('Connection refused');
+                },
+                fn () => $this->clock->advance(2000),
+                'test',
+                expectedWaitMs: 5000,
+            );
+
+            $this->fail('Expected the outage to spend the budget.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame(2, $operations);
+            $this->assertStringContainsString('gave up after 2 retries and 9000ms', $exception->getMessage());
+        }
+    }
+
+    /**
      * Rediscovery runs on its own clocks, and the deadline used to be checked only before it: a rediscovery that
      * outlived the budget was followed by another attempt anyway.
      * It now ends the loop, with the attempt it was preparing never started.

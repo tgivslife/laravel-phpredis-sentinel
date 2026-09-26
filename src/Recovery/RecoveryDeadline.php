@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Recovery;
 
+use ValueError;
+
 /**
  * The instant a failover recovery must be over by, on the monotonic clock.
  *
- * One absolute instant, handed down from {@see SentinelRetryPolicy::run()} through rediscovery and into every
- * socket wait, so each phase measures what is left when it starts rather than inheriting a budget computed
- * earlier. Null in the callbacks' signatures means unbounded: a policy without a deadline, or a blocking operation.
+ * An absolute instant, handed down from {@see SentinelRetryPolicy::run()} through rediscovery and into every
+ * socket wait, so each phase measures what is left when it starts rather than inheriting a budget computed earlier.
+ * Only an operation's expected wait moves it later ({@see self::extendedBy()}).
+ * Null in the callbacks' signatures means unbounded: a policy without a deadline, or a blocking operation.
  *
  * @internal
  */
@@ -38,6 +41,20 @@ final readonly class RecoveryDeadline
     }
 
     /**
+     * The same deadline moved later by the given number of milliseconds; this one when there is nothing to add.
+     *
+     * @throws ValueError When the extension is negative: a deadline is never moved earlier.
+     */
+    public function extendedBy(int $milliseconds): self
+    {
+        if ($milliseconds < 0) {
+            throw new ValueError('A recovery deadline cannot be moved earlier.');
+        }
+
+        return $milliseconds === 0 ? $this : new self($this->clock, $this->at + $milliseconds * 1_000_000);
+    }
+
+    /**
      * Milliseconds left, never negative.
      *
      * Rounded down, so it reaches 0 up to a millisecond before the deadline passes: use spent() to test expiry,
@@ -56,9 +73,9 @@ final readonly class RecoveryDeadline
     /**
      * A socket timeout cut down to what is left, in seconds.
      *
-     * A configured value of zero or less means unbounded and becomes the remainder outright. Never zero on the way
-     * out, since that would mean unbounded again: a spent deadline yields the minimum, and callers that must not
-     * start work on a spent deadline check spent() first.
+     * A configured value of zero or less means unbounded and becomes the remainder outright.
+     * Never zero on the way out, since that would mean unbounded again: a spent deadline yields the minimum,
+     * and callers that must not start work on a spent deadline check spent() first.
      */
     public function clamp(float $configuredSeconds): float
     {

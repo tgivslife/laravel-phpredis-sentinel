@@ -7,6 +7,7 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Recovery;
 use PHPUnit\Framework\TestCase;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\FakeClock;
+use ValueError;
 
 final class RecoveryDeadlineTest extends TestCase
 {
@@ -35,6 +36,25 @@ final class RecoveryDeadlineTest extends TestCase
         $this->assertTrue($deadline->spent());
         $this->assertSame(0, $deadline->remainingMs());
         $this->assertSame(0.001, $deadline->clamp(2.0), 'zero would mean wait forever');
+    }
+
+    public function test_an_extended_deadline_is_a_new_instant_later_by_the_extension(): void
+    {
+        $clock = new FakeClock;
+        $deadline = RecoveryDeadline::after($clock, $clock->now(), 50);
+
+        $this->assertSame(250, $deadline->extendedBy(200)->remainingMs());
+        $this->assertSame(50, $deadline->remainingMs(), 'the original deadline does not move');
+        $this->assertSame($deadline, $deadline->extendedBy(0), 'no extension, the same instant');
+    }
+
+    public function test_a_deadline_is_never_moved_earlier(): void
+    {
+        $clock = new FakeClock;
+
+        $this->expectExceptionObject(new ValueError('A recovery deadline cannot be moved earlier.'));
+
+        RecoveryDeadline::after($clock, $clock->now(), 50)->extendedBy(-1);
     }
 
     public function test_remaining_milliseconds_round_down_so_only_spent_decides_expiry(): void

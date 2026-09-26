@@ -24,7 +24,7 @@ use Throwable;
  *
  * `attempts` caps the re-runs and `deadlineMs` the wall clock. The deadline is the bound that matters, since one
  * attempt against a dead master can cost a connect timeout, a read timeout, phpredis' own retries and a sweep of every sentinel.
- * It is one instant ({@see RecoveryDeadline}), handed to the operation and the rediscovery.
+ * It is one instant ({@see RecoveryDeadline}), moved later only by an operation's expected wait ({@see self::run()}).
  *
  * Once it has passed, no package-controlled work starts: no attempt, rediscovery, sentinel probe or client setup stage.
  * Socket waits are cut to what is left, except in blocking operations ({@see self::forBlockingOperations()}).
@@ -119,20 +119,22 @@ final class SentinelRetryPolicy
     /**
      * Run an operation, re-running it while its failure looks like a failover.
      *
-     * Both callables receive the recovery deadline (null when unbounded) to clamp their socket waits to.
-     * A rediscovery that spends the deadline ends the loop: the attempt it prepared could only overrun.
+     * Both callables get the recovery deadline (null when unbounded) to clamp their socket waits to; a rediscovery
+     * that spends it ends the loop. An operation that waits by design (a blocking pop) passes its expected wait:
+     * each attempt's deadline moves later by it, and what an attempt spent, up to that wait, is not recovery time.
      *
      * @template TResult
      *
      * @param  callable(?RecoveryDeadline): TResult  $operation  The client operation.
      * @param  callable(?RecoveryDeadline): void  $onRetry  Runs between attempts; forced rediscovery lives here.
      * @param  string  $context  Names the caller in the log lines and the give-up message.
+     * @param  int<0, max>  $expectedWaitMs  How long each attempt is expected to wait, in milliseconds.
      * @return TResult The first successful result.
      *
      * @throws SentinelFailoverException When the attempt budget or the deadline is spent.
      * @throws Throwable Anything that is not failover-class, propagated untouched.
      */
-    public function run(callable $operation, callable $onRetry, string $context): mixed
+    public function run(callable $operation, callable $onRetry, string $context, int $expectedWaitMs = 0): mixed
     {
         $attempts = 0;
         $startedAt = $this->clock->now();
@@ -142,11 +144,15 @@ final class SentinelRetryPolicy
             $attemptStartedAt = $this->clock->now();
 
             try {
-                return $operation($deadline);
+                // The attempt may wait its whole expected wait, so it gets that much more for its own socket waits.
+                return $operation($deadline?->extendedBy($expectedWaitMs));
             } catch (Throwable $exception) {
                 if (! $this->isRetryable($exception)) {
                     throw $exception;
                 }
+
+                // Only the time the attempt actually took, up to its expected wait, is kept off the recovery.
+                $deadline = $deadline?->extendedBy(max(0, min($expectedWaitMs, $this->elapsedMs($attemptStartedAt))));
 
                 if ($this->attemptDidWork($attemptStartedAt)) {
                     $attempts = 0;
@@ -155,7 +161,7 @@ final class SentinelRetryPolicy
 
                 $elapsedMs = $this->elapsedMs($startedAt);
 
-                if (RetrySuppression::active() || $attempts >= $this->attempts || $this->deadlineWouldPass($elapsedMs)) {
+                if (RetrySuppression::active() || $attempts >= $this->attempts || $this->deadlineWouldPass($deadline)) {
                     throw $this->exhausted($context, $attempts, $elapsedMs, $exception);
                 }
 
@@ -233,12 +239,12 @@ final class SentinelRetryPolicy
     }
 
     /**
-     * Whether another attempt, counting the delay before it, would outlive the deadline. Never for blocking
-     * operations, whose elapsed time is healthy subscription time, not recovery.
+     * Whether another attempt, counting the delay before it, would outlive the deadline.
+     * Never without one: blocking operations, whose elapsed time is healthy subscription time, and a budget with no wall-clock bound.
      */
-    private function deadlineWouldPass(int $elapsedMs): bool
+    private function deadlineWouldPass(?RecoveryDeadline $deadline): bool
     {
-        return ! $this->blocking && $this->deadlineMs > 0 && $elapsedMs + $this->delayMs >= $this->deadlineMs;
+        return $deadline !== null && $this->delayMs >= $deadline->remainingMs();
     }
 
     /**
