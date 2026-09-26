@@ -81,6 +81,10 @@ final class SentinelRetryPolicyTest extends TestCase
             // vendor's handling, so missing it here would be an outright regression rather than a gap.
             'vendor parity' => 'Error while reading line from the server',
             'matched without regard to case' => 'CONNECTION REFUSED by peer',
+            // Windows words a refused and an unanswered connect its own way (phpredis 6.3, Windows 11).
+            'refused connect on Windows' => 'No connection could be made because the target machine actively refused it',
+            'unanswered connect on Windows' => 'A connection attempt failed because the connected party did not properly '
+                .'respond after a period of time, or established connection failed because connected host has failed to respond',
         ];
 
         foreach ($messages as $label => $message) {

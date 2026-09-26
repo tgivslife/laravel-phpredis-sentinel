@@ -44,6 +44,7 @@ final class SentinelRetryPolicy
      * that loop, except the RedisCluster-only `Error processing response from Redis node`.
      *
      * `instance state changed` is the `UNBLOCKED` error a demoted master gives its blocked clients.
+     * `actively refused` and `did not properly respond` are how Windows words a refused and an unanswered connect.
      *
      * `NOREPLICAS` is left out on purpose: after a failover the new master has no replica until the old one
      * resyncs, which outlasts any budget, so retrying would only add the deadline to every write.
@@ -51,6 +52,7 @@ final class SentinelRetryPolicy
      * @var list<string>
      */
     private const array RETRYABLE_ERROR_FRAGMENTS = [
+        'actively refused',
         "can't write against a read only replica",
         'broken pipe',
         'connection closed',
@@ -58,6 +60,7 @@ final class SentinelRetryPolicy
         'connection refused',
         'connection reset',
         'connection timed out',
+        'did not properly respond',
         'error while reading',
         'failed while reconnecting',
         'getaddrinfo',
