@@ -23,7 +23,8 @@ use Throwable;
  * Here every entry point that talks to the client directly runs in the retry policy's loop instead, and a retry rebuilds
  * the client through the connector with a forced rediscovery.
  * Every other command - `__call`, `eval`, `flushdb` and the rest - already goes through command(), and wrapping it again would nest two loops.
- * A blocking pop with a finite timeout reads under it plus headroom, so a healthy wait is not taken for a failover.
+ * A blocking pop with a finite timeout reads under it plus headroom, so a healthy wait is not taken for a failover,
+ * and one with no timeout waits in slices of the read timeout.
  *
  * A retried write whose reply was lost may run twice, and a retried pipeline replays the whole batch.
  *
@@ -48,9 +49,9 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     ];
 
     /**
-     * A blocking pop's headroom when the read timeout has no limit, in seconds.
+     * What a blocking pop uses for a read timeout that has no limit, as headroom and as a slice's length, in seconds.
      */
-    private const float DEFAULT_HEADROOM_SECONDS = 2.0;
+    private const float NO_LIMIT_STANDIN_SECONDS = 2.0;
 
     /**
      * Whether an exhausted budget left the client dead, to be rebuilt before the next operation.
@@ -97,13 +98,19 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function command($method, array $parameters = [])
     {
-        $wait = $this->blockingWait($method, $parameters);
+        $timeout = $this->blockingTimeout($method, $parameters);
 
-        if ($wait === null) {
+        if ($timeout === null || $timeout[1] < 0) {
             return $this->retryOnFailure(fn () => Connection::command($method, $parameters));
         }
 
-        return $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $wait);
+        [$position, $wait] = $timeout;
+
+        if ($wait > 0) {
+            return $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $wait);
+        }
+
+        return $this->popInSlices($method, $parameters, $position);
     }
 
     /**
@@ -310,14 +317,15 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * A blocking pop's timeout in seconds, found by the command's position table; null for any other command.
+     * Where a blocking pop's timeout sits in its arguments, and its value in seconds; null for any other command.
      *
-     * Only a positive number qualifies: 0 (no limit) and negatives go to Redis unchanged. A numeric string counts,
-     * since brpoplpush, blmove, blmpop and bzmpop wait it out; the other four refuse it with a warning at once.
+     * A numeric string counts only where phpredis takes one: brpoplpush, blmove, blmpop and bzmpop wait it out,
+     * while the pops that take their timeout last refuse it at once, and are left to do so.
      *
      * @param  array<array-key, mixed>  $parameters
+     * @return array{array-key, float}|null
      */
-    private function blockingWait(string $method, array $parameters): ?float
+    private function blockingTimeout(string $method, array $parameters): ?array
     {
         $position = self::BLOCKING_TIMEOUT_POSITIONS[strtolower($method)] ?? null;
 
@@ -325,9 +333,35 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
             return null;
         }
 
-        $timeout = $parameters[$position === -1 ? array_key_last($parameters) : $position] ?? null;
+        $key = $position === -1 ? array_key_last($parameters) : $position;
+        $timeout = $parameters[$key] ?? null;
 
-        return is_numeric($timeout) && (float) $timeout > 0 ? (float) $timeout : null;
+        if (is_int($timeout) || is_float($timeout) || ($position !== -1 && is_numeric($timeout))) {
+            return [$key, (float) $timeout];
+        }
+
+        return null;
+    }
+
+    /**
+     * Run a blocking pop that has no timeout as finite waits, one slice each, until a slice is not empty.
+     *
+     * Lifting the read timeout instead would leave a hung master unnoticed. Each slice is a pop of its own, so it
+     * recovers under a deadline of its own. An error reply is `false` too, so an empty reply loops only without one.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     */
+    private function popInSlices(string $method, array $parameters, int|string $position): mixed
+    {
+        while (true) {
+            $parameters[$position] = $slice = $this->finiteReadTimeout();
+
+            $result = $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $slice);
+
+            if (! self::isEmptyReply($result) || $this->client->getLastError() !== null) {
+                return $result;
+            }
+        }
     }
 
     /**
@@ -347,7 +381,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
         $result = Connection::command($method, $parameters);
 
-        if ($result === false || $result === null || $result === []) {
+        if (self::isEmptyReply($result)) {
             $error = $this->client->getLastError();
 
             if ($error !== null && str_contains($error, 'instance state changed')) {
@@ -359,18 +393,36 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
+     * Whether a blocking pop came back empty: `[]` from the pops that take their timeout last, `false` from the rest.
+     */
+    private static function isEmptyReply(mixed $result): bool
+    {
+        return $result === false || $result === null || $result === [];
+    }
+
+    /**
      * A blocking pop's read timeout: its wait plus the socket's own read timeout as headroom, cut to the deadline.
      *
-     * The headroom is 2.0 s when the read timeout has no limit, which would end the read before the wait does.
      * The deadline has moved later by the wait, so only the headroom is cut, unless a stale rebuild spent the budget.
      * The result is then at most the wait, and the caller refuses the pop.
      */
     private function blockingReadTimeout(?RecoveryDeadline $deadline, float $wait): float
     {
-        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
-        $timeout = $wait + ($configured > 0 ? $configured : self::DEFAULT_HEADROOM_SECONDS);
+        $timeout = $wait + $this->finiteReadTimeout();
 
         return $deadline?->clamp($timeout) ?? $timeout;
+    }
+
+    /**
+     * The socket's own read timeout, or 2.0 s when it has no limit: a blocking pop's headroom, and a slice's length.
+     *
+     * Without a limit the headroom would end the read before the wait does, and a slice would never end.
+     */
+    private function finiteReadTimeout(): float
+    {
+        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
+
+        return $configured > 0 ? $configured : self::NO_LIMIT_STANDIN_SECONDS;
     }
 
     /**

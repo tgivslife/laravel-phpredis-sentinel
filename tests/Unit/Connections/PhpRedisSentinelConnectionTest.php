@@ -927,4 +927,170 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
         $this->assertSame([$popReadTimeout, $restored, $popReadTimeout, $restored], $client->readTimeouts);
     }
+
+    /**
+     * A timeout of 0 waits for ever, which a read timeout would cut short and lifting it would leave a hung master
+     * unnoticed: the pop waits in slices of the read timeout instead, each a pop of its own, until one is not empty.
+     */
+    public function test_a_pop_without_a_timeout_waits_in_slices_until_an_element_arrives(): void
+    {
+        $client = $this->blockingClient([
+            ['ms' => 2000, 'return' => []],
+            ['ms' => 2000, 'return' => []],
+            ['return' => ['q', 'job']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 0));
+        $this->assertSame(array_fill(0, 3, ['blpop', [['q'], 2.0], 4.0]), $client->calls);
+        $this->assertSame([], $refreshes, 'an empty slice is not a failover');
+    }
+
+    /**
+     * @return array<string, array{string, list<mixed>, list<mixed>, mixed}>
+     */
+    public static function popsWithoutATimeout(): array
+    {
+        return [
+            // method, arguments, the arguments of each slice, reply when empty
+            'blpop' => ['blpop', [['q'], 0], [['q'], 2.0], []],
+            'brpop' => ['brpop', [['q'], 0], [['q'], 2.0], []],
+            'bzpopmin' => ['bzpopmin', [['z'], 0], [['z'], 2.0], []],
+            'bzpopmax' => ['bzpopmax', [['z'], 0], [['z'], 2.0], []],
+            'brpoplpush' => ['brpoplpush', ['src', 'dst', 0], ['src', 'dst', 2.0], false],
+            'blmove' => ['blmove', ['src', 'dst', 'LEFT', 'RIGHT', 0], ['src', 'dst', 'LEFT', 'RIGHT', 2.0], false],
+            'blmpop' => ['blmpop', [0, ['q'], 'LEFT', 1], [2.0, ['q'], 'LEFT', 1], false],
+            'bzmpop' => ['bzmpop', [0, ['z'], 'MIN', 1], [2.0, ['z'], 'MIN', 1], false],
+            'a float 0' => ['blpop', [['q'], 0.0], [['q'], 2.0], []],
+            'a numeric-string 0, where phpredis takes one' => ['brpoplpush', ['src', 'dst', '0'], ['src', 'dst', 2.0], false],
+        ];
+    }
+
+    /**
+     * Each pop in the table gets its slice in its own timeout position, and loops on its own empty reply.
+     *
+     * @param  list<mixed>  $arguments
+     * @param  list<mixed>  $slice
+     */
+    #[DataProvider('popsWithoutATimeout')]
+    public function test_every_blocking_pop_without_a_timeout_waits_in_slices(
+        string $method,
+        array $arguments,
+        array $slice,
+        mixed $emptyReply,
+    ): void {
+        $client = $this->blockingClient([['return' => $emptyReply], ['return' => 'element']]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame('element', $connection->{$method}(...$arguments));
+        $this->assertSame([[$method, $slice, 4.0], [$method, $slice, 4.0]], $client->calls);
+    }
+
+    /**
+     * Each slice recovers under a deadline of its own: the time the empty slices before it took is not recovery.
+     */
+    public function test_a_failover_between_slices_recovers_under_a_fresh_deadline(): void
+    {
+        $client = $this->blockingClient([
+            ['ms' => 2000, 'return' => []],
+            ['ms' => 2000, 'return' => []],
+            ['ms' => 2000, 'return' => []],
+            ['throw' => 'read error on connection to 10.0.0.9:6380'],
+            ['return' => ['q', 'job']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 1000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 0));
+        $this->assertSame([true], $refreshes);
+    }
+
+    public function test_the_budget_can_run_out_inside_one_slice(): void
+    {
+        $client = $this->blockingClient([
+            ['return' => []],
+            ['throw' => 'read error on connection to 10.0.0.9:6380'],
+            ['throw' => 'read error on connection to 10.0.0.9:6380'],
+            ['return' => ['q', 'job']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, attempts: 1, deadlineMs: 5000);
+
+        try {
+            $connection->blpop(['q'], 0);
+            $this->fail('Expected the slice to give up.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertStringContainsString('gave up after 1 retry', $exception->getMessage());
+            $this->assertCount(3, $client->calls, 'no slice after the one that gave up');
+        }
+    }
+
+    public function test_an_error_reply_ends_a_pop_without_a_timeout_instead_of_looping(): void
+    {
+        // phpredis returns an error reply as false, the text in getLastError(): that is not an empty slice.
+        $client = $this->blockingClient([
+            ['error' => 'WRONGTYPE Operation against a key holding the wrong kind of value', 'return' => false],
+            ['return' => ['q', 'job']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertFalse($connection->brpoplpush('src', 'dst', 0));
+        $this->assertCount(1, $client->calls);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function stringTimeouts(): array
+    {
+        return ['0' => ['0'], '5' => ['5']];
+    }
+
+    /**
+     * phpredis refuses a string timeout in the pops that take it last, at once and without an error to go by, so
+     * the call goes to it untouched: a slice would pass a float and turn the refusal into a wait.
+     */
+    #[DataProvider('stringTimeouts')]
+    public function test_a_string_timeout_in_a_pop_that_takes_it_last_is_left_to_phpredis(string $timeout): void
+    {
+        $client = $this->blockingClient([['return' => false], ['return' => ['q', 'job']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertNull($connection->blpop(['q'], $timeout));
+        $this->assertSame([['blpop', [['q'], $timeout], 2.0]], $client->calls, 'one ordinary call');
+    }
+
+    /**
+     * @return array<string, array{float, float}>
+     */
+    public static function sliceLengths(): array
+    {
+        $default = (float) ini_get('default_socket_timeout');
+
+        return [
+            // reported read timeout, the slice
+            '0 (unset)' => [0.0, $default],
+            'negative (no limit)' => [-1.0, 2.0],
+        ];
+    }
+
+    /**
+     * A slice is as long as the headroom: the socket's own read timeout, or 2.0 s when it has no limit.
+     */
+    #[DataProvider('sliceLengths')]
+    public function test_a_read_timeout_that_is_not_positive_gives_the_slice_the_socket_has(float $readTimeout, float $slice): void
+    {
+        $client = $this->blockingClient([['return' => []], ['return' => ['q', 'job']]], readTimeout: $readTimeout);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $connection->blpop(['q'], 0);
+
+        $this->assertSame([['q'], $slice], $client->calls[0][1]);
+        $this->assertSame($slice + $slice, $client->calls[0][2], 'the slice plus the same headroom');
+    }
 }
