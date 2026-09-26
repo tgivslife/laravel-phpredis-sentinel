@@ -170,6 +170,40 @@ final class SentinelRetryPolicyTest extends TestCase
         }
     }
 
+    /**
+     * The deadline decides whether work may start, never whether finished work counts: a result that arrives after
+     * it, on the first attempt or on a retry, is returned, since its effect on the server has happened anyway.
+     */
+    public function test_a_result_that_arrives_after_the_deadline_is_returned(): void
+    {
+        $this->assertSame('OK', $this->policy(3, 0, 100)->run(
+            function (): string {
+                $this->clock->advance(150);
+
+                return 'OK';
+            },
+            static fn () => null,
+            'test',
+        ));
+
+        $calls = 0;
+
+        $this->assertSame('OK', $this->policy(3, 0, 100)->run(
+            function () use (&$calls): string {
+                if (++$calls === 1) {
+                    throw new RedisException('Connection refused');
+                }
+
+                $this->clock->advance(150);
+
+                return 'OK';
+            },
+            static fn () => null,
+            'test',
+        ));
+        $this->assertSame(2, $calls);
+    }
+
     public function test_the_retry_delay_is_waited_on_the_clock(): void
     {
         $startedAt = $this->clock->now();
