@@ -20,7 +20,7 @@ use Throwable;
  * Laravel's own recovery rebuilds the client from the address it already has, which after a failover is the old master.
  * Here every entry point that talks to the client directly runs in the retry policy's loop instead, and a retry rebuilds
  * the client through the connector with a forced rediscovery.
- * Everything else - `__call`, `eval`, `flushdb` and the rest - already goes through command(), and wrapping it again would nest two loops.
+ * Every other command - `__call`, `eval`, `flushdb` and the rest - already goes through command(), and wrapping it again would nest two loops.
  *
  * A retried write whose reply was lost may run twice, and a retried pipeline replays the whole batch.
  *
@@ -301,7 +301,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * Run a callback under a temporary read timeout, the previous one restored in a finally.
+     * Run a callback under a temporary read timeout, restored in a finally on the client it was set on: the callback
+     * may replace the connection's client, and the replacement keeps its own.
      *
      * @template TResult
      *
@@ -310,14 +311,15 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     private function withReadTimeout(float $seconds, callable $callback): mixed
     {
-        $previous = $this->client->getOption(Redis::OPT_READ_TIMEOUT);
+        $client = $this->client;
+        $previous = $client->getOption(Redis::OPT_READ_TIMEOUT);
 
-        $this->client->setOption(Redis::OPT_READ_TIMEOUT, $seconds);
+        $client->setOption(Redis::OPT_READ_TIMEOUT, $seconds);
 
         try {
             return $callback();
         } finally {
-            $this->client->setOption(Redis::OPT_READ_TIMEOUT, $previous);
+            $client->setOption(Redis::OPT_READ_TIMEOUT, $previous);
         }
     }
 }

@@ -153,23 +153,39 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             }
 
             /**
+             * Delivers one message, as phpredis calls the handler: ($redis, $channel, $message).
+             *
              * @param  array<array-key, string>  $channels
              */
             public function subscribe(array $channels, callable $callback): void
+            {
+                $this->establish();
+
+                $callback($this, $channels[0] ?? '', 'message');
+            }
+
+            /**
+             * Delivers one message, as phpredis calls the handler: ($redis, $pattern, $channel, $message).
+             *
+             * @param  array<array-key, string>  $patterns
+             */
+            public function psubscribe(array $patterns, callable $callback): void
+            {
+                $this->establish();
+
+                $callback($this, $patterns[0] ?? '', 'channel', 'message');
+            }
+
+            /**
+             * Count the subscription, and fail it while failures are left.
+             */
+            private function establish(): void
             {
                 $this->subscribes++;
 
                 if ($this->failures-- > 0) {
                     throw new RedisException('Connection lost');
                 }
-            }
-
-            /**
-             * @param  array<array-key, string>  $patterns
-             */
-            public function psubscribe(array $patterns, callable $callback): void
-            {
-                $this->subscribe($patterns, $callback);
             }
         };
     }
@@ -271,6 +287,27 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         } catch (SentinelFailoverException) {
             $this->assertSame([-1.0, 2.0, -1.0, 2.0], $client->readTimeouts);
         }
+    }
+
+    /**
+     * A message handler that uses the connection can replace its client mid-subscription; the lifted read timeout
+     * still goes back on the subscriber it was lifted on, and the replacement keeps its own.
+     */
+    public function test_a_read_timeout_is_restored_on_the_client_it_was_changed_on_when_the_client_is_replaced(): void
+    {
+        $subscriber = $this->subscriberClient(failures: 0);
+        $replacement = $this->flakyClient(0, 'unused');
+        $refreshes = [];
+        $connection = $this->connection($subscriber, $replacement, $refreshes);
+
+        // The subscriber's ping fails, so the command's retry rebuilds the connection onto the replacement.
+        $connection->subscribe(['events'], static function () use ($connection): void {
+            $connection->command('ping');
+        });
+
+        $this->assertSame($replacement, $connection->client());
+        $this->assertSame([-1.0, 2.0], $subscriber->readTimeouts, 'lifted and restored on the subscriber itself');
+        $this->assertSame([], $replacement->readTimeouts, 'the replacement keeps its own read timeout');
     }
 
     public function test_psubscribe_behaves_like_subscribe(): void
