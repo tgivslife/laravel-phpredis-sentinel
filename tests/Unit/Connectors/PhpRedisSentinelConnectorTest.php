@@ -681,6 +681,27 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertSame([0.5, 0.5, 0.5], $this->clients[0]->readTimeouts, 'AUTH, SELECT, then the restore');
     }
 
+    public function test_an_unset_read_timeout_comes_back_as_the_default_socket_timeout(): void
+    {
+        // A client connected without one reads under default_socket_timeout; 0 set on a live socket fails every read.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', ['password' => 'secret']), []);
+
+        $this->assertSame([5.0, (float) ini_get('default_socket_timeout')], $this->clients[0]->readTimeouts, 'AUTH, then the restore');
+    }
+
+    public function test_an_unset_read_timeout_is_cut_to_the_deadline_from_what_the_socket_waits(): void
+    {
+        // A deadline longer than default_socket_timeout must not lengthen the connect's or a stage's read.
+        $default = (float) ini_get('default_socket_timeout');
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', ['password' => 'secret', 'retry_deadline' => 100_000]), []);
+
+        $this->assertSame($default, $this->clientConfigs[0]['read_timeout'], 'the client is connected under it');
+        $this->assertSame([$default, $default], $this->clients[0]->readTimeouts, 'AUTH, then the restore');
+    }
+
     public function test_each_setup_stage_waits_at_most_what_the_stages_before_it_left(): void
     {
         $config = $this->config('s1:26379', [

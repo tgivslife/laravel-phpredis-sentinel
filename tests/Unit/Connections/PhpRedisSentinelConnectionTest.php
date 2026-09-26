@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Connections;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Redis;
 use RedisException;
@@ -228,6 +229,84 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             }
 
             public function discard(): void {}
+        };
+    }
+
+    /**
+     * A client that answers any command (the blocking pops, xread) by following a script, one step per call.
+     *
+     * Each step may move the clock ('ms'), then throws ('throw'), leaves an error for getLastError() ('error'), and
+     * returns ('return'). Every call is recorded with its arguments and the read timeout in force.
+     *
+     * @param  list<array{ms?: int, throw?: string, error?: string, return?: mixed}>  $script
+     */
+    private function blockingClient(array $script, float $readTimeout = 2.0, ?string $lastError = null): object
+    {
+        return new class($script, $readTimeout, $lastError, $this->clock)
+        {
+            /** @var list<array{string, list<mixed>, float}> Every command: its name, arguments and read timeout. */
+            public array $calls = [];
+
+            /** @var list<float> Every value OPT_READ_TIMEOUT was set to, in order. */
+            public array $readTimeouts = [];
+
+            /**
+             * @param  list<array{ms?: int, throw?: string, error?: string, return?: mixed}>  $script
+             */
+            public function __construct(
+                private array $script,
+                private float $readTimeout,
+                private ?string $lastError,
+                private readonly FakeClock $clock,
+            ) {}
+
+            /**
+             * @param  list<mixed>  $arguments
+             */
+            public function __call(string $method, array $arguments): mixed
+            {
+                $this->calls[] = [$method, $arguments, $this->readTimeout];
+                $step = array_shift($this->script) ?? [];
+
+                $this->clock->advance($step['ms'] ?? 0);
+
+                if (isset($step['throw'])) {
+                    throw new RedisException($step['throw']);
+                }
+
+                if (isset($step['error'])) {
+                    $this->lastError = $step['error'];
+                }
+
+                return $step['return'] ?? [];
+            }
+
+            public function getOption(int $option): float
+            {
+                return $option === Redis::OPT_READ_TIMEOUT ? $this->readTimeout : 0.0;
+            }
+
+            public function setOption(int $option, mixed $value): bool
+            {
+                if ($option === Redis::OPT_READ_TIMEOUT) {
+                    $this->readTimeout = (float) $value;
+                    $this->readTimeouts[] = (float) $value;
+                }
+
+                return true;
+            }
+
+            public function clearLastError(): bool
+            {
+                $this->lastError = null;
+
+                return true;
+            }
+
+            public function getLastError(): ?string
+            {
+                return $this->lastError;
+            }
         };
     }
 
@@ -543,5 +622,309 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
         $this->assertSame('PONG', $connection->command('ping'));
         $this->assertSame(2, $callCount, 'the second attempt must rediscover again after the first failed');
+    }
+
+    /**
+     * A healthy wait longer than the read timeout is not a failover: the pop reads under its wait plus the configured
+     * read timeout as headroom, and the configured value comes back afterwards.
+     */
+    public function test_a_blocking_pop_waits_its_timeout_plus_headroom_without_a_rediscovery(): void
+    {
+        $client = $this->blockingClient([['ms' => 5000, 'return' => ['q', 'job']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 5));
+        $this->assertSame([7.0, 2.0], $client->readTimeouts);
+        $this->assertSame([], $refreshes);
+    }
+
+    /**
+     * @return array<string, array{string, list<mixed>, float, mixed, mixed}>
+     */
+    public static function blockingPops(): array
+    {
+        return [
+            // method, arguments, read timeout at the call, reply when empty, what the caller gets back
+            'blpop' => ['blpop', [['q'], 3], 5.0, [], null],
+            'brpop' => ['brpop', [['q'], 3], 5.0, [], null],
+            'bzpopmin' => ['bzpopmin', [['z'], 3], 5.0, [], []],
+            'bzpopmax' => ['bzpopmax', [['z'], 3], 5.0, [], []],
+            'brpoplpush' => ['brpoplpush', ['src', 'dst', 3], 5.0, false, false],
+            'blmove' => ['blmove', ['src', 'dst', 'LEFT', 'RIGHT', 3], 5.0, false, false],
+            'blmpop' => ['blmpop', [3, ['q'], 'LEFT', 1], 5.0, false, false],
+            'bzmpop' => ['bzmpop', [3, ['z'], 'MIN', 1], 5.0, false, false],
+            'a float timeout' => ['blpop', [['q'], 0.5], 2.5, [], null],
+            'a numeric-string timeout' => ['brpoplpush', ['src', 'dst', '3'], 5.0, false, false],
+        ];
+    }
+
+    /**
+     * Each pop in the table, called the way an application would (Laravel's blpop()/brpop(), __call for the rest):
+     * its timeout is found in its own position, and an empty reply comes back as a normal result.
+     *
+     * @param  list<mixed>  $arguments
+     */
+    #[DataProvider('blockingPops')]
+    public function test_every_blocking_pop_reads_under_its_own_timeout(
+        string $method,
+        array $arguments,
+        float $readTimeout,
+        mixed $emptyReply,
+        mixed $result,
+    ): void {
+        $client = $this->blockingClient([['return' => $emptyReply]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame($result, $connection->{$method}(...$arguments));
+        $this->assertSame([$method, $arguments, $readTimeout], $client->calls[0]);
+        $this->assertSame([], $refreshes, 'an empty wait is not a failover');
+    }
+
+    /**
+     * Laravel lowercases what goes through `__call`, and PHP resolves `bLPop()` to `blpop()` by itself, but
+     * `command()` passes a name on as given: `Redis::command('bRPopLPush', …)`, in phpredis' own spelling.
+     */
+    public function test_a_pop_named_as_phpredis_spells_it_through_command_is_found(): void
+    {
+        $client = $this->blockingClient([['return' => false]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertFalse($connection->command('bRPopLPush', ['src', 'dst', 3]));
+        $this->assertSame(['bRPopLPush', ['src', 'dst', 3], 5.0], $client->calls[0]);
+    }
+
+    /**
+     * @return array<string, array{string, list<mixed>, array{throw?: string, error?: string, return?: mixed}, mixed}>
+     */
+    public static function unblockedPops(): array
+    {
+        $unblocked = 'UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)';
+
+        return [
+            // method, arguments, the demoted master's answer, the element popped after the rediscovery
+            'an empty reply, the error left behind (six pops)' => ['blpop', [['q'], 5], ['error' => $unblocked, 'return' => false], ['q', 'job']],
+            'an exception (brpoplpush and blmove)' => ['brpoplpush', ['src', 'dst', 5], ['throw' => $unblocked], 'job'],
+        ];
+    }
+
+    /**
+     * A master demoted mid-wait by a plain REPLICAOF, which unlike Sentinel leaves its clients connected, answers
+     * UNBLOCKED in one of two shapes (measured with phpredis 6.3.0 and Redis 7.4): pop() turns the empty reply into
+     * an exception, and the policy's fragment makes either one a failover.
+     *
+     * @param  list<mixed>  $arguments
+     * @param  array{throw?: string, error?: string, return?: mixed}  $answer
+     */
+    #[DataProvider('unblockedPops')]
+    public function test_a_pop_unblocked_by_its_master_being_demoted_is_a_failover(
+        string $method,
+        array $arguments,
+        array $answer,
+        mixed $element,
+    ): void {
+        $client = $this->blockingClient([$answer, ['return' => $element]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame($element, $connection->{$method}(...$arguments));
+        $this->assertSame([true], $refreshes, 'the demotion ended the wait: rediscover and pop again');
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function staleErrors(): array
+    {
+        return [
+            'an earlier WRONGTYPE' => ['WRONGTYPE Operation against a key holding the wrong kind of value'],
+            'an earlier UNBLOCKED' => ['UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)'],
+        ];
+    }
+
+    /**
+     * phpredis keeps the last error text after later commands succeed, so only an error the pop itself left counts.
+     */
+    #[DataProvider('staleErrors')]
+    public function test_an_old_error_left_on_the_client_does_not_turn_an_empty_wait_into_a_failover(string $lastError): void
+    {
+        $client = $this->blockingClient([['return' => []]], lastError: $lastError);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertNull($connection->blpop(['q'], 5));
+        $this->assertSame([], $refreshes);
+        $this->assertCount(1, $client->calls);
+    }
+
+    /**
+     * The demotion Sentinel makes: when it reconfigures the old master it kills that master's clients, so a pop
+     * waiting there gets a read error (measured: about 11 s after SENTINEL FAILOVER), not UNBLOCKED. The pop is
+     * retried after a rediscovery, again with its whole wait plus headroom: the time already waited is not held
+     * against it.
+     * Each client gets its own read timeout back.
+     */
+    public function test_a_pop_whose_connection_is_closed_mid_wait_retries_with_its_whole_wait(): void
+    {
+        $client = $this->blockingClient([['ms' => 4500, 'throw' => 'read error on connection to 10.0.0.9:6380']]);
+        $replacement = $this->blockingClient([['return' => ['q', 'job']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, $replacement, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 5));
+        $this->assertSame([true], $refreshes);
+        $this->assertSame([7.0, 2.0], $client->readTimeouts);
+        $this->assertSame([7.0, 2.0], $replacement->readTimeouts);
+    }
+
+    public function test_a_negative_timeout_takes_the_ordinary_path_and_its_false_comes_back_untouched(): void
+    {
+        $client = $this->blockingClient([['error' => 'ERR timeout is negative', 'return' => false]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertFalse($connection->bzmpop(-1, ['z'], 'MIN', 1));
+        $this->assertSame(2.0, $client->calls[0][2]);
+        $this->assertSame([], $refreshes);
+    }
+
+    public function test_the_read_timeout_goes_back_after_a_blocking_pop_that_throws(): void
+    {
+        $client = $this->blockingClient([['throw' => 'WRONGTYPE Operation against a key holding the wrong kind of value']]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        try {
+            $connection->blpop(['q'], 5);
+            $this->fail('Expected the application error to propagate.');
+        } catch (RedisException $exception) {
+            $this->assertStringContainsString('WRONGTYPE', $exception->getMessage());
+            $this->assertSame([7.0, 2.0], $client->readTimeouts);
+        }
+    }
+
+    public function test_no_pop_starts_once_the_deadline_is_spent(): void
+    {
+        // 1 s of wait plus 1 s of budget: the read timeout runs out at 2 s, and only the wait is credited.
+        $client = $this->blockingClient([['ms' => 2000, 'throw' => 'read error on connection to 10.0.0.9:6380']]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 1000);
+
+        try {
+            $connection->blpop(['q'], 1);
+            $this->fail('Expected the spent deadline to end the pop.');
+        } catch (SentinelFailoverException) {
+            $this->assertSame(2.0, $client->calls[0][2], 'the wait plus the 1 s left, not the whole headroom');
+            $this->assertCount(1, $client->calls, 'no second pop on a spent deadline');
+        }
+    }
+
+    /**
+     * @return array<string, array{int}>
+     */
+    public static function rebuildsThatSpendTheBudget(): array
+    {
+        return ['past the budget' => [6000], 'ending exactly at it' => [5000]];
+    }
+
+    /**
+     * A pop's attempt deadline is moved later by its wait, so a stale rebuild can spend the budget and still leave
+     * that deadline unspent. The pop would then read under at most its own wait, and even an empty queue would end
+     * in a read error: it is refused like any command whose budget the rebuild spent.
+     */
+    #[DataProvider('rebuildsThatSpendTheBudget')]
+    public function test_a_stale_rebuild_that_spends_the_budget_ends_a_pop_before_it_is_sent(int $rebuildMs): void
+    {
+        $dead = $this->blockingClient([['throw' => 'Connection refused']]);
+        $healthy = $this->blockingClient([['return' => []]]);
+        $handOut = $dead;
+
+        $connector = function (bool $refresh = false) use (&$handOut, $rebuildMs): object {
+            $this->clock->advance($rebuildMs);
+
+            return $handOut;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(0, 0, 5000), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $handOut = $healthy;
+
+        try {
+            $connection->blpop(['q'], 5);
+            $this->fail('Expected the spent rebuild to end the pop.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertStringContainsString('rebuilding the client', $exception->getMessage());
+            $this->assertSame([], $healthy->calls, 'no pop on a budget the rebuild spent');
+        }
+    }
+
+    public function test_xread_takes_the_ordinary_path(): void
+    {
+        // Its block is an option in milliseconds, not a timeout the table knows.
+        $client = $this->blockingClient([['return' => []]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $connection->xread(['s' => '$'], 1, 5000);
+
+        $this->assertSame(2.0, $client->calls[0][2]);
+    }
+
+    public function test_an_unset_read_timeout_is_cut_to_the_deadline_from_what_the_socket_waits(): void
+    {
+        // A client reporting 0 waits default_socket_timeout, so a longer deadline must not lengthen that wait.
+        $client = $this->blockingClient([['return' => false]], readTimeout: 0.0);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 100_000);
+
+        $connection->get('k');
+
+        $this->assertSame((float) ini_get('default_socket_timeout'), $client->calls[0][2]);
+    }
+
+    /**
+     * @return array<string, array{float, float, float}>
+     */
+    public static function readTimeoutsThatAreNotPositive(): array
+    {
+        $default = (float) ini_get('default_socket_timeout');
+
+        return [
+            // reported read timeout, the pop's read timeout, what is put back
+            // Without one the socket waits default_socket_timeout; 0 set on a live socket fails every read.
+            '0 (unset)' => [0.0, 5.0 + $default, $default],
+            'negative (no limit)' => [-1.0, 7.0, -1.0],
+        ];
+    }
+
+    /**
+     * The headroom is the read timeout the socket actually has, the same for every pop: `default_socket_timeout` when
+     * none was set. Nothing validates the read timeout yet, and with no limit the headroom would end the read before
+     * the end of the wait, so it is then 2.0 s. Without a deadline, as here, the pop is the only thing that changes
+     * the read timeout, so what it puts back is what the next command gets.
+     */
+    #[DataProvider('readTimeoutsThatAreNotPositive')]
+    public function test_a_read_timeout_that_is_not_positive_gives_the_headroom_the_socket_has(
+        float $readTimeout,
+        float $popReadTimeout,
+        float $restored,
+    ): void {
+        $client = $this->blockingClient([['return' => ['q', 'job']], ['return' => ['q', 'job']]], readTimeout: $readTimeout);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $connection->blpop(['q'], 5);
+        $connection->blpop(['q'], 5);
+
+        $this->assertSame([$popReadTimeout, $restored, $popReadTimeout, $restored], $client->readTimeouts);
     }
 }

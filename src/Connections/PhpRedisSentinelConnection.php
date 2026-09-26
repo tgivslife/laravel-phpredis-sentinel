@@ -9,9 +9,11 @@ use Illuminate\Redis\Connections\Connection;
 use Illuminate\Redis\Connections\PhpRedisConnection;
 use Psr\Log\LoggerInterface;
 use Redis;
+use RedisException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
+use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
 use Throwable;
 
 /**
@@ -21,6 +23,7 @@ use Throwable;
  * Here every entry point that talks to the client directly runs in the retry policy's loop instead, and a retry rebuilds
  * the client through the connector with a forced rediscovery.
  * Every other command - `__call`, `eval`, `flushdb` and the rest - already goes through command(), and wrapping it again would nest two loops.
+ * A blocking pop with a finite timeout reads under it plus headroom, so a healthy wait is not taken for a failover.
  *
  * A retried write whose reply was lost may run twice, and a retried pipeline replays the whole batch.
  *
@@ -28,6 +31,27 @@ use Throwable;
  */
 final class PhpRedisSentinelConnection extends PhpRedisConnection
 {
+    /**
+     * The blocking pops, and the argument each takes its timeout in: an index, or -1 for the last argument.
+     *
+     * @var array<string, int>
+     */
+    private const array BLOCKING_TIMEOUT_POSITIONS = [
+        'blmove' => 4,
+        'blmpop' => 0,
+        'blpop' => -1,
+        'brpop' => -1,
+        'brpoplpush' => 2,
+        'bzmpop' => 0,
+        'bzpopmax' => -1,
+        'bzpopmin' => -1,
+    ];
+
+    /**
+     * A blocking pop's headroom when the read timeout has no limit, in seconds.
+     */
+    private const float DEFAULT_HEADROOM_SECONDS = 2.0;
+
     /**
      * Whether an exhausted budget left the client dead, to be rebuilt before the next operation.
      */
@@ -73,7 +97,13 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function command($method, array $parameters = [])
     {
-        return $this->retryOnFailure(fn () => Connection::command($method, $parameters));
+        $wait = $this->blockingWait($method, $parameters);
+
+        if ($wait === null) {
+            return $this->retryOnFailure(fn () => Connection::command($method, $parameters));
+        }
+
+        return $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $wait);
     }
 
     /**
@@ -193,36 +223,44 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * Run the operation, rediscovering the master and retrying on failover-class errors.
      *
      * Under a deadline, every attempt, the first included, runs with the read timeout cut to what is left.
+     * A blocking pop's attempts run with their wait plus headroom instead, the deadline moved later by the wait.
      * A stale client rebuilt on the way in that spent the deadline doing so ends the operation before the command runs.
      *
      * @template TResult
      *
      * @param  callable(): TResult  $callback  The client operation.
      * @param  SentinelRetryPolicy|null  $policy  Overrides the connection's budget, for blocking operations.
+     * @param  float|null  $wait  A blocking pop's timeout in seconds; null for everything else.
      * @return TResult
      *
      * @throws SentinelFailoverException When the retry budget is spent (the last failure as previous, if any).
      * @throws Throwable When the error is not failover-class (propagated untouched).
      */
-    private function retryOnFailure(callable $callback, ?SentinelRetryPolicy $policy = null): mixed
+    private function retryOnFailure(callable $callback, ?SentinelRetryPolicy $policy = null, ?float $wait = null): mixed
     {
         try {
             return ($policy ?? $this->retryPolicy)->run(
-                function (?RecoveryDeadline $deadline) use ($callback) {
+                function (?RecoveryDeadline $deadline) use ($callback, $wait) {
                     $this->refreshStaleClient($deadline);
 
-                    // Not retryable, so the loop lets it through: the budget was spent before the command ran.
-                    if ($deadline?->spent()) {
+                    $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
+
+                    // Not retryable, so the loop lets it through: the budget was spent before the command ran. A pop
+                    // whose whole wait no longer fits counts as spent too: even an empty wait would end in an error.
+                    if ($deadline?->spent() || ($readTimeout !== null && $readTimeout <= $wait)) {
                         throw new SentinelFailoverException(sprintf(
                             'Redis sentinel connection [%s] gave up: the recovery deadline was spent rebuilding the client',
                             $this->getName() ?? 'unknown',
                         ));
                     }
 
-                    return $this->withReadTimeoutWithin($deadline, $callback);
+                    return $readTimeout === null
+                        ? $this->withReadTimeoutWithin($deadline, $callback)
+                        : $this->withReadTimeout($readTimeout, $callback);
                 },
                 $this->refreshClient(...),
                 sprintf('connection [%s]', $this->getName() ?? 'unknown'),
+                max(0, (int) ceil(($wait ?? 0) * 1000)),
             );
         } catch (SentinelFailoverException $exception) {
             // Rebuild lazily: rebuilding now would spend the time the deadline just refused.
@@ -272,6 +310,70 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
+     * A blocking pop's timeout in seconds, found by the command's position table; null for any other command.
+     *
+     * Only a positive number qualifies: 0 (no limit) and negatives go to Redis unchanged. A numeric string counts,
+     * since brpoplpush, blmove, blmpop and bzmpop wait it out; the other four refuse it with a warning at once.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     */
+    private function blockingWait(string $method, array $parameters): ?float
+    {
+        $position = self::BLOCKING_TIMEOUT_POSITIONS[strtolower($method)] ?? null;
+
+        if ($position === null || $parameters === []) {
+            return null;
+        }
+
+        $timeout = $parameters[$position === -1 ? array_key_last($parameters) : $position] ?? null;
+
+        return is_numeric($timeout) && (float) $timeout > 0 ? (float) $timeout : null;
+    }
+
+    /**
+     * Run one blocking pop, raising the demotion an empty reply can hide.
+     *
+     * A master demoted by a plain REPLICAOF (Sentinel drops the clients instead) answers `UNBLOCKED … instance state changed`.
+     * phpredis throws it for brpoplpush and blmove; the other six return an empty reply, the text only in getLastError().
+     * That text outlives later commands, so it is cleared first.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     *
+     * @throws RedisException When the master was demoted during the wait.
+     */
+    private function pop(string $method, array $parameters): mixed
+    {
+        $this->client->clearLastError();
+
+        $result = Connection::command($method, $parameters);
+
+        if ($result === false || $result === null || $result === []) {
+            $error = $this->client->getLastError();
+
+            if ($error !== null && str_contains($error, 'instance state changed')) {
+                throw new RedisException($error);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * A blocking pop's read timeout: its wait plus the socket's own read timeout as headroom, cut to the deadline.
+     *
+     * The headroom is 2.0 s when the read timeout has no limit, which would end the read before the wait does.
+     * The deadline has moved later by the wait, so only the headroom is cut, unless a stale rebuild spent the budget.
+     * The result is then at most the wait, and the caller refuses the pop.
+     */
+    private function blockingReadTimeout(?RecoveryDeadline $deadline, float $wait): float
+    {
+        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
+        $timeout = $wait + ($configured > 0 ? $configured : self::DEFAULT_HEADROOM_SECONDS);
+
+        return $deadline?->clamp($timeout) ?? $timeout;
+    }
+
+    /**
      * Run a subscription with the read timeout lifted, restored afterward.
      *
      * An idle subscriber would otherwise hit the read timeout every few seconds with a failover-class read error.
@@ -295,7 +397,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
             return $callback();
         }
 
-        $configured = (float) $this->client->getOption(Redis::OPT_READ_TIMEOUT);
+        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
 
         return $this->withReadTimeout($deadline->clamp($configured), $callback);
     }
@@ -312,7 +414,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     private function withReadTimeout(float $seconds, callable $callback): mixed
     {
         $client = $this->client;
-        $previous = $client->getOption(Redis::OPT_READ_TIMEOUT);
+        $previous = ReadTimeout::effective((float) $client->getOption(Redis::OPT_READ_TIMEOUT));
 
         $client->setOption(Redis::OPT_READ_TIMEOUT, $seconds);
 

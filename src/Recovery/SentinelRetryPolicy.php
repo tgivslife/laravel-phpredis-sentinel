@@ -27,7 +27,8 @@ use Throwable;
  * It is one instant ({@see RecoveryDeadline}), moved later only by an operation's expected wait ({@see self::run()}).
  *
  * Once it has passed, no package-controlled work starts: no attempt, rediscovery, sentinel probe or client setup stage.
- * Socket waits are cut to what is left, except in blocking operations ({@see self::forBlockingOperations()}).
+ * Socket waits are cut to what is left, except in blocking operations: a subscription has no deadline
+ * ({@see self::forBlockingOperations()}), and a blocking pop's deadline moves by its wait: only its headroom is cut.
  * It cannot cut a wait already under way, or work inside phpredis (DNS, TCP and TLS setup, its own reconnects and backoff),
  * so a recovery can end after the deadline; by how much has not been measured, and no maximum is promised.
  *
@@ -41,6 +42,8 @@ final class SentinelRetryPolicy
      *
      * Includes every fragment Laravel's PhpRedisConnection::command() recovers from, since the connection bypasses
      * that loop, except the RedisCluster-only `Error processing response from Redis node`.
+     *
+     * `instance state changed` is the `UNBLOCKED` error a demoted master gives its blocked clients.
      *
      * `NOREPLICAS` is left out on purpose: after a failover the new master has no replica until the old one
      * resyncs, which outlasts any budget, so retrying would only add the deadline to every write.
@@ -58,6 +61,7 @@ final class SentinelRetryPolicy
         'error while reading',
         'failed while reconnecting',
         'getaddrinfo',
+        'instance state changed',
         'is loading the dataset in memory',
         'masterdown',
         'name or service not known',

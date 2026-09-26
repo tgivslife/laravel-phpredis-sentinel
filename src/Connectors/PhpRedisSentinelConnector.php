@@ -18,6 +18,7 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\MonotonicClock;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
+use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
 
 /**
  * Opens a phpredis connection to whichever node the sentinels currently name as master.
@@ -133,7 +134,8 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 self::withoutDiscoveryKeys($config), ['host' => $host, 'port' => $port], $options, $formattedOptions,
             );
 
-            // Setup runs under timeouts cut to the deadline; the configured read timeout returns for later commands.
+            // Setup runs under timeouts cut to the deadline; the configured read timeout, or default_socket_timeout
+            // when unset, returns for later commands.
             $client = ($this->clients)(
                 $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $deadline),
             );
@@ -148,7 +150,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 }
             } finally {
                 if ($deadline !== null) {
-                    $client->setOption(Redis::OPT_READ_TIMEOUT, self::floatSetting($clientConfig, 'read_timeout', 0.0));
+                    $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(self::floatSetting($clientConfig, 'read_timeout', 0.0)));
                 }
             }
 
@@ -258,7 +260,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 );
             }
 
-            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(self::floatSetting($config, 'read_timeout', 0.0)));
+            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(ReadTimeout::effective(self::floatSetting($config, 'read_timeout', 0.0))));
         }
 
         $run();
@@ -452,7 +454,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     {
         if ($deadline !== null) {
             $config['timeout'] = $deadline->clamp(self::floatSetting($config, 'timeout', 0.0));
-            $config['read_timeout'] = $deadline->clamp(self::floatSetting($config, 'read_timeout', 0.0));
+            $config['read_timeout'] = $deadline->clamp(ReadTimeout::effective(self::floatSetting($config, 'read_timeout', 0.0)));
         }
 
         return $config;
