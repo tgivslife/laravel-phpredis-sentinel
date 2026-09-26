@@ -23,9 +23,13 @@ use Throwable;
  * fails while connecting and never reaches the command loop.
  *
  * `attempts` caps the re-runs and `deadlineMs` the wall clock. The deadline is the bound that matters, since one
- * attempt against a dead master can cost a connect timeout, a read timeout, phpredis' own retries and a sweep of
- * every sentinel. It is one instant ({@see RecoveryDeadline}), handed to the operation and the rediscovery so each
- * socket wait is cut to what is left; a wait already under way cannot be interrupted.
+ * attempt against a dead master can cost a connect timeout, a read timeout, phpredis' own retries and a sweep of every sentinel.
+ * It is one instant ({@see RecoveryDeadline}), handed to the operation and the rediscovery.
+ *
+ * Once it has passed, no package-controlled work starts: no attempt, rediscovery, sentinel probe or client setup stage.
+ * Socket waits are cut to what is left, except in blocking operations ({@see self::forBlockingOperations()}).
+ * It cannot cut a wait already under way, or work inside phpredis (DNS, TCP and TLS setup, its own reconnects and backoff),
+ * so a recovery can end after the deadline; by how much has not been measured, and no maximum is promised.
  *
  * @internal
  */
