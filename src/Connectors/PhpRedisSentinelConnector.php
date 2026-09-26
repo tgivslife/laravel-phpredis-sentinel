@@ -134,6 +134,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 self::withoutDiscoveryKeys($config), ['host' => $host, 'port' => $port], $options, $formattedOptions,
             );
 
+            // phpredis would reconnect a socket closed while idle to the same address, after a graceful failover the
+            // demoted master; without its reconnects the close fails the next command, and the retry rediscovers.
+            // Overrides any configured value: Laravel's stock config sets 3, which cannot be told from a chosen 3.
+            $clientConfig['max_retries'] = 0;
+
             // Setup runs under timeouts cut to the deadline; the configured read timeout, or default_socket_timeout
             // when unset, returns for later commands.
             $client = ($this->clients)(

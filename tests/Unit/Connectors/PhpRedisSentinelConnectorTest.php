@@ -316,7 +316,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             'port' => '6379',
             'password' => 'secret',
             'database' => '2',
-            'max_retries' => 3,
+            'backoff_cap' => 1000,
             'sentinel_username' => 'ops',
             'sentinel_password' => 'sentinel-secret',
             'sentinel_timeout' => 0.25,
@@ -341,7 +341,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertArrayNotHasKey('password', $client);
         $this->assertArrayNotHasKey('database', $client);
         $this->assertSame([['auth', 'secret'], ['select', 2]], $this->clients[0]->calls);
-        $this->assertSame(3, $client['max_retries']);
+        $this->assertSame(1000, $client['backoff_cap']);
     }
 
     /**
@@ -376,6 +376,38 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             $this->clients[0]->calls,
             'AUTH, SELECT and SETNAME in that order, then the role check of a rediscovery',
         );
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>}>
+     */
+    public static function maxRetriesSettings(): array
+    {
+        return [
+            // the connection's own settings, the global options
+            'unset' => [[], []],
+            "Laravel's stock 3, on the connection" => [['max_retries' => 3], []],
+            'in the connection options' => [['options' => ['max_retries' => 1]], []],
+            'in the global options' => [[], ['max_retries' => 10]],
+        ];
+    }
+
+    /**
+     * phpredis reconnects a socket closed while idle to the same address by itself, up to `max_retries` times: after
+     * a graceful failover, the demoted master. With none, the close fails the next command, which the policy moves.
+     * Laravel's stock config sets 3, which cannot be told from a deliberate 3, so any value is overridden.
+     * createClient() applies `max_retries` right after connecting, so it is in force before AUTH.
+     *
+     * @param  array<string, mixed>  $extra
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('maxRetriesSettings')]
+    public function test_the_data_node_client_gets_no_reconnects_of_its_own(array $extra, array $options): void
+    {
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', $extra), $options);
+
+        $this->assertSame(0, $this->clientConfigs[0]['max_retries']);
     }
 
     /**
