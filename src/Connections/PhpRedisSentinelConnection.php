@@ -284,9 +284,12 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     private function retryOnFailure(callable $callback, ?SentinelRetryPolicy $policy = null, ?float $wait = null): mixed
     {
+        $startedOn = $this->client;
+        $failedOn = null;
+
         try {
             return ($policy ?? $this->retryPolicy)->run(
-                function (?RecoveryDeadline $deadline) use ($callback, $wait) {
+                function (?RecoveryDeadline $deadline) use ($callback, $wait, &$failedOn) {
                     $this->refreshStaleClient($deadline);
 
                     $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
@@ -300,17 +303,26 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
                         ));
                     }
 
-                    return $readTimeout === null
-                        ? $this->withReadTimeoutWithin($deadline, $callback)
-                        : $this->withReadTimeout($readTimeout, $callback);
+                    $client = $this->client;
+
+                    try {
+                        return $readTimeout === null
+                            ? $this->withReadTimeoutWithin($deadline, $callback)
+                            : $this->withReadTimeout($readTimeout, $callback);
+                    } catch (Throwable $exception) {
+                        $failedOn = $client;
+
+                        throw $exception;
+                    }
                 },
                 $this->refreshClient(...),
                 sprintf('connection [%s]', $this->getName() ?? 'unknown'),
                 max(0, (int) ceil(($wait ?? 0) * 1000)),
             );
         } catch (SentinelFailoverException $exception) {
-            // Rebuild lazily: rebuilding now would spend the time the deadline just refused.
-            $this->clientIsStale = true;
+            // Flag for a lazy rebuild, since rebuilding now would spend time the deadline refused;
+            // a client rebuilt in this operation that nothing has failed on is kept.
+            $this->clientIsStale = $this->client === $startedOn || $this->client === $failedOn;
 
             throw $exception;
         }

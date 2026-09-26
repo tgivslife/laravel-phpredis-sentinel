@@ -710,6 +710,142 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         }
     }
 
+    /**
+     * A rebuild that succeeded but spent the deadline ends its operation, and leaves a client nothing has failed on:
+     * the next operation runs on it instead of rebuilding again. One forced rebuild per exhaustion.
+     */
+    public function test_a_successful_rebuild_that_spent_the_deadline_is_not_rebuilt_again(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $healthy = $this->flakyClient(0, 'unused');
+        $handOut = $dead;
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$handOut, &$rebuilds): object {
+            $rebuilds++;
+            $this->clock->advance(40);
+
+            return $handOut;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1, 0, 30), $this->logger);
+
+        foreach (['exhausts: flagged stale', 'the rebuild spends the deadline'] as $step) {
+            try {
+                $connection->command('ping');
+                $this->fail("Expected the operation to give up ({$step}).");
+            } catch (SentinelFailoverException) {
+                $handOut = $healthy;
+            }
+        }
+
+        $rebuildsBefore = $rebuilds;
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame($rebuildsBefore, $rebuilds, 'no second rebuild');
+        $this->assertSame(1, $healthy->pings);
+    }
+
+    public function test_a_failed_rebuild_that_spent_the_deadline_is_rebuilt_again(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $healthy = $this->flakyClient(0, 'unused');
+        $rediscoveryFails = true;
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$rediscoveryFails, &$rebuilds, $healthy): object {
+            $rebuilds++;
+
+            if ($rediscoveryFails) {
+                $this->clock->advance(40);
+
+                throw new RedisException('No sentinel answered');
+            }
+
+            return $healthy;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1, 0, 30), $this->logger);
+
+        foreach (['exhausts: flagged stale', 'the rebuild fails and spends the deadline'] as $step) {
+            try {
+                $connection->command('ping');
+                $this->fail("Expected the operation to give up ({$step}).");
+            } catch (SentinelFailoverException) {
+                // The dead client is kept.
+            }
+        }
+
+        $rediscoveryFails = false;
+        $rebuildsBefore = $rebuilds;
+        $deadPings = $dead->pings;
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame($rebuildsBefore + 1, $rebuilds, 'the dead client kept by the failed rebuild is rebuilt');
+        $this->assertSame($deadPings, $dead->pings, 'before anything is sent to it again');
+    }
+
+    /**
+     * The same inside the retry loop: a rediscovery that succeeded but spent the deadline leaves a client nothing has
+     * failed on, while a rediscovered client whose attempt failed is flagged like any other.
+     */
+    public function test_a_client_rediscovered_by_the_retry_is_flagged_only_once_it_failed(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $fresh = $this->flakyClient(0, 'unused');
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$rebuilds, $fresh): object {
+            $rebuilds++;
+            $this->clock->advance(40);
+
+            return $fresh;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1, 0, 30), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the rediscovery to spend the deadline.');
+        } catch (SentinelFailoverException) {
+            // Rediscovered once, then out of time before an attempt on it.
+        }
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame(1, $rebuilds, 'the rediscovered client is used as it is');
+    }
+
+    public function test_a_rediscovered_client_that_failed_too_is_rebuilt_by_the_next_operation(): void
+    {
+        $first = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $second = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $healthy = $this->flakyClient(0, 'unused');
+        $handOut = [$second, $healthy];
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$handOut, &$rebuilds): object {
+            $rebuilds++;
+
+            return array_shift($handOut) ?? throw new RuntimeException('no more clients');
+        };
+
+        $connection = new PhpRedisSentinelConnection($first, $connector, [], $this->policy(1), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust on the rediscovered client too.');
+        } catch (SentinelFailoverException) {
+            // $second was rediscovered, and its attempt failed.
+        }
+
+        $secondPings = $second->pings;
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame(2, $rebuilds, 'the failed rediscovered client is replaced');
+        $this->assertSame($secondPings, $second->pings, 'before anything is sent to it again');
+        $this->assertSame(1, $healthy->pings);
+    }
+
     public function test_a_failed_rediscovery_keeps_the_previous_client_instead_of_a_closed_one(): void
     {
         $client = $this->flakyClient(1, 'Connection lost');
@@ -1353,8 +1489,8 @@ final class PhpRedisSentinelConnectionTest extends TestCase
     /**
      * Laravel's RateLimiter writes its counters raw inside withoutSerializationOrCompression(), with the SETEX of
      * RedisStore::put() among others. A failover inside the callback replaces the client: the retried SETEX must run
-     * raw too, or phpredis serializes the counter and the next INCR fails on it, and the options must come back on
-     * the client the connection holds afterwards, not on the one it dropped.
+     * raw too, or phpredis serializes the counter, the next INCRBY returns false and the limiter counts 0 hits, and
+     * the options must come back on the client the connection holds afterwards, not on the one it dropped.
      */
     public function test_a_client_replaced_inside_without_serialization_or_compression_is_packed_raw_too(): void
     {
