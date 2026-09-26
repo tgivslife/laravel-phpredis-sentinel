@@ -19,6 +19,7 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
 use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
+use Throwable;
 
 /**
  * Opens a phpredis connection to whichever node the sentinels currently name as master.
@@ -64,9 +65,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     private const array SETUP_COMMAND_KEYS = ['password' => true, 'database' => true, 'name' => true];
 
     /**
-     * Per-process master address cache: discovery cache key => [host, port].
+     * Per-process master address cache: masterCacheKey() => [host, port].
      *
-     * A stale entry costs one failed attempt before the retry rediscovers; no cross-process cache by design.
+     * Holds only a node whose client was built and, on a rediscovery, verified as master, and drops one whose client
+     * failed, so a stale entry costs one failed attempt before the retry rediscovers.
+     * No cross-process cache by design.
      *
      * @var array<string, array{0: string, 1: int}>
      */
@@ -127,8 +130,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             $formattedOptions['prefix'] = $config['prefix'];
         }
 
-        $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use ($config, $options, $formattedOptions): Redis {
-            [$host, $port] = $this->resolveMaster($config, $refresh, $deadline);
+        $service = self::stringSetting($config, 'sentinel_service', 'mymaster');
+        $hosts = $this->sentinelClients->parseHosts(self::hostList($config));
+        $cacheKey = self::masterCacheKey($service, $hosts, $config);
+
+        $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use (
+            $config, $options, $formattedOptions, $service, $hosts, $cacheKey,
+        ): Redis {
+            [$host, $port] = $this->resolveMaster($config, $service, $hosts, $cacheKey, $refresh, $deadline);
 
             $clientConfig = array_merge(
                 self::withoutDiscoveryKeys($config), ['host' => $host, 'port' => $port], $options, $formattedOptions,
@@ -139,25 +148,36 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             // Overrides any configured value: Laravel's stock config sets 3, which cannot be told from a chosen 3.
             $clientConfig['max_retries'] = 0;
 
-            // Setup runs under timeouts cut to the deadline; the configured read timeout, or default_socket_timeout
-            // when unset, returns for later commands.
-            $client = ($this->clients)(
-                $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $deadline),
-            );
-
             try {
-                $this->sendSetupCommands($client, $clientConfig, $deadline, "{$host}:{$port}");
+                // Setup runs under timeouts cut to the deadline; the configured read timeout, or
+                // default_socket_timeout when unset, returns for later commands.
+                $client = ($this->clients)(
+                    $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $deadline),
+                );
 
-                if ($refresh) {
-                    $this->stage($client, $clientConfig, $deadline, "the role check of [{$host}:{$port}]", function () use ($client, $host, $port): void {
-                        $this->assertMaster($client, $host, $port);
-                    });
+                try {
+                    $this->sendSetupCommands($client, $clientConfig, $deadline, "{$host}:{$port}");
+
+                    if ($refresh) {
+                        $this->stage($client, $clientConfig, $deadline, "the role check of [{$host}:{$port}]", function () use ($client, $host, $port): void {
+                            $this->assertMaster($client, $host, $port);
+                        });
+                    }
+                } finally {
+                    if ($deadline !== null) {
+                        $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(self::floatSetting($clientConfig, 'read_timeout', 0.0)));
+                    }
                 }
-            } finally {
-                if ($deadline !== null) {
-                    $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(self::floatSetting($clientConfig, 'read_timeout', 0.0)));
+            } catch (Throwable $exception) {
+                // A cache hit skips the role check, so an address whose client failed must not be served again.
+                if ((self::$resolvedMasters[$cacheKey] ?? null) === [$host, $port]) {
+                    unset(self::$resolvedMasters[$cacheKey]);
                 }
+
+                throw $exception;
             }
+
+            self::$resolvedMasters[$cacheKey] = [$host, $port];
 
             return $client;
         };
@@ -347,19 +367,23 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * Unreachable and unaware sentinels are skipped; when none names a master, the exception names every host tried
      * and records whether any answered, which separates an election from an outage.
      * Under a deadline each probe waits at most what is left, and once nothing is left the rest are named as not tried.
+     * Only reads the cache: the caller writes it once the node's client is built and, on a rediscovery, verified.
      *
      * @param  array<string, mixed>  $config
+     * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
      * @return array{0: string, 1: int}
      *
      * @throws SentinelDiscoveryException When no sentinel names a usable master.
      * @throws RuntimeException When no sentinel host is configured, or a setting is malformed.
      */
-    private function resolveMaster(array $config, bool $refresh, ?RecoveryDeadline $deadline): array
-    {
-        $service = self::stringSetting($config, 'sentinel_service', 'mymaster');
-        $hosts = $this->sentinelClients->parseHosts(self::hostList($config));
-        $cacheKey = $service.'|'.implode(',', array_map(static fn (array $host): string => "{$host[0]}:{$host[1]}", $hosts));
-
+    private function resolveMaster(
+        array $config,
+        string $service,
+        array $hosts,
+        string $cacheKey,
+        bool $refresh,
+        ?RecoveryDeadline $deadline,
+    ): array {
         if (! $refresh && isset(self::$resolvedMasters[$cacheKey])) {
             return self::$resolvedMasters[$cacheKey];
         }
@@ -404,7 +428,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 continue;
             }
 
-            return self::$resolvedMasters[$cacheKey] = $master;
+            return $master;
         }
 
         throw new SentinelDiscoveryException(sprintf(
@@ -412,6 +436,29 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             $service,
             implode('; ', $failures),
         ), anySentinelAnswered: $answered);
+    }
+
+    /**
+     * The master cache key: the service, the sentinel endpoints and a hash of the sentinel credentials.
+     *
+     * A cache hit asks no sentinel, so connections that differ only in their credentials must not share an entry.
+     * Only a hash of them goes into the key, never the values.
+     *
+     * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
+     * @param  array<string, mixed>  $config
+     *
+     * @throws RuntimeException When a credential is not a scalar.
+     */
+    private static function masterCacheKey(string $service, array $hosts, array $config): string
+    {
+        $credentials = hash('sha256', serialize([
+            self::stringSetting($config, 'sentinel_username', ''),
+            self::stringSetting($config, 'sentinel_password', ''),
+        ]));
+
+        return $service
+            .'|'.implode(',', array_map(static fn (array $host): string => "{$host[0]}:{$host[1]}", $hosts))
+            .'|'.$credentials;
     }
 
     /**

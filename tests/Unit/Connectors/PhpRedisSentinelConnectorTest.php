@@ -278,6 +278,9 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             'database' => [['database' => []], 'database must be a number, array given.'],
             'password entry' => [['password' => [['ops']]], 'password must be a string, array given.'],
             'username' => [['username' => ['ops'], 'password' => 'secret'], 'username must be a string, array given.'],
+            // Read for the master cache key before any sentinel is asked, so refused before it is serialized.
+            'sentinel_password' => [['sentinel_password' => new class {}], 'sentinel_password must be a string, class@anonymous given.'],
+            'sentinel_username' => [['sentinel_username' => ['ops']], 'sentinel_username must be a string, array given.'],
         ];
     }
 
@@ -483,6 +486,131 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertSame(['10.0.0.9:6380', '10.0.0.2:6381'], $this->clientHosts, 'the cached master first, then a rediscovery');
         $this->assertSame(1, $this->discoveries);
         $this->assertInstanceOf(PhpRedisSentinelConnection::class, $connection);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>}>
+     */
+    public static function roleCheckRefusals(): array
+    {
+        return [
+            // how the rediscovered 10.0.0.9 is refused, extra connection settings
+            'a replica' => [['replicaHosts' => ['10.0.0.9']], []],
+            'an INFO that throws' => [['infoErrorHosts' => ['10.0.0.9']], []],
+            'an INFO that is not an array' => [['noInfoHosts' => ['10.0.0.9']], []],
+            'the deadline spent before its role check' => [['buildMs' => ['10.0.0.9' => 200]], ['retry_deadline' => 100]],
+        ];
+    }
+
+    /**
+     * A cache hit skips the role check, so an address may be cached only once its client was built and, on a
+     * rediscovery, passed that check: otherwise the next connect() in the process is served the refused node.
+     *
+     * @param  array<string, mixed>  $refusal
+     * @param  array<string, mixed>  $extra
+     */
+    #[DataProvider('roleCheckRefusals')]
+    public function test_a_node_the_role_check_refuses_is_never_served_from_the_cache(array $refusal, array $extra): void
+    {
+        $config = $this->config('s1:26379', ['retry_attempts' => 1] + $extra);
+
+        // A connection before the failover caches 10.0.0.7.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+
+        // 10.0.0.7 dies, and the sentinel names 10.0.0.9 before its promotion has landed: the budget runs out.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']], ...$refusal, deadMasters: ['10.0.0.7'])
+                ->connect($config, []);
+            $this->fail('Expected the budget to run out on the refused node.');
+        } catch (SentinelFailoverException) {
+            // As expected.
+        }
+
+        $this->forgetRecordings();
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.2', '6381']])->connect($config, []);
+
+        $this->assertSame(['10.0.0.2:6381'], $this->clientHosts, 'the next connect() discovers instead of taking 10.0.0.9');
+        $this->assertSame(1, $this->discoveries);
+    }
+
+    public function test_a_cached_master_whose_client_fails_is_evicted(): void
+    {
+        $config = $this->config('s1:26379');
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+
+        // 10.0.0.7 dies while no sentinel answers either: the connect fails, and the dead address must not stay.
+        try {
+            $this->connector([], deadMasters: ['10.0.0.7'])->connect($config, []);
+            $this->fail('Expected the connect to fail.');
+        } catch (SentinelDiscoveryException) {
+            // As expected: no sentinel answered.
+        }
+
+        $this->forgetRecordings();
+
+        // 10.0.0.7 is back, now as a replica the sentinels no longer name.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.2', '6381']])->connect($config, []);
+
+        $this->assertSame(['10.0.0.2:6381'], $this->clientHosts, 'the next connect() discovers at once');
+        $this->assertSame(1, $this->discoveries);
+    }
+
+    /**
+     * Only the address whose client failed is evicted: a rediscovered node the role check refuses leaves the
+     * entry for the master that still works.
+     */
+    public function test_a_refused_rediscovery_keeps_the_cached_master_it_did_not_replace(): void
+    {
+        $answers = [['10.0.0.7', '6380'], ['10.0.0.9', '6380']];
+        $config = $this->config('s1:26379');
+
+        $connection = $this->connector(['s1:26379' => static function () use (&$answers): mixed {
+            return array_shift($answers);
+        }], replicaHosts: ['10.0.0.9'])->connect($config, []);
+
+        $rebuild = (new ReflectionProperty(PhpRedisConnection::class, 'connector'))->getValue($connection);
+        $this->assertInstanceOf(Closure::class, $rebuild);
+
+        try {
+            $rebuild();
+            $this->fail('Expected the role check to refuse 10.0.0.9.');
+        } catch (SentinelDiscoveryException) {
+            // As expected.
+        }
+
+        $this->forgetRecordings();
+        $this->connector([])->connect($config, []);
+
+        $this->assertSame(['10.0.0.7:6380'], $this->clientHosts, 'still served from the cache');
+        $this->assertSame(0, $this->discoveries);
+    }
+
+    /**
+     * A cache hit asks no sentinel, so connections that differ only in their sentinel credentials must not share an
+     * entry: one with wrong credentials would work until its first rediscovery, during a failover.
+     */
+    public function test_the_master_cache_is_kept_apart_by_sentinel_credentials(): void
+    {
+        $connector = $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']]);
+        $config = $this->config('s1:26379');
+
+        $connector->connect($config + ['sentinel_username' => 'ops', 'sentinel_password' => 'sentinel-secret'], []);
+        $connector->connect($config + ['sentinel_username' => 'ops', 'sentinel_password' => 'another-secret'], []);
+        $this->assertSame(2, $this->discoveries, 'a different password discovers');
+
+        // ACL users made from one template often share a password.
+        $connector->connect($config + ['sentinel_username' => 'other', 'sentinel_password' => 'sentinel-secret'], []);
+        $this->assertSame(3, $this->discoveries, 'a different username discovers too');
+
+        $connector->connect($config + ['sentinel_username' => 'ops', 'sentinel_password' => 'sentinel-secret'], []);
+        $this->assertSame(3, $this->discoveries, 'identical credentials share the entry');
+
+        $keys = implode("\n", array_keys((new ReflectionProperty(PhpRedisSentinelConnector::class, 'resolvedMasters'))->getValue()));
+        $this->assertStringNotContainsString('secret', $keys, 'no password in the cache key');
+        $this->assertStringNotContainsString('ops', $keys, 'nor a username');
+        $this->assertStringNotContainsString('other', $keys);
     }
 
     /**
