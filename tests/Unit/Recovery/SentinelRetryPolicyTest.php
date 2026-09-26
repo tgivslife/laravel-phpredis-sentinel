@@ -187,6 +187,67 @@ final class SentinelRetryPolicyTest extends TestCase
     }
 
     /**
+     * The delay is checked against the deadline before sleeping, but a sleep only promises a minimum: one that ends
+     * past the deadline starts neither the rediscovery nor another attempt.
+     */
+    public function test_a_retry_sleep_that_overshoots_the_deadline_starts_no_rediscovery(): void
+    {
+        $clock = new FakeClock(sleepOvershootMs: 60);
+        $operations = 0;
+        $rediscoveries = 0;
+
+        try {
+            (new SentinelRetryPolicy($this->logger, 3, 50, 100, clock: $clock))->run(
+                function () use (&$operations): void {
+                    $operations++;
+
+                    throw new RedisException('Connection refused');
+                },
+                function () use (&$rediscoveries): void {
+                    $rediscoveries++;
+                },
+                'test',
+            );
+
+            $this->fail('Expected the overshooting sleep to end the loop.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame(0, $rediscoveries, 'no rediscovery may start once the sleep has spent the budget');
+            $this->assertSame(1, $operations, 'no attempt may start either');
+            $this->assertStringContainsString('gave up after 1 retry and 110ms', $exception->getMessage());
+        }
+    }
+
+    /**
+     * An overshoot that still ends inside the deadline takes nothing away: the rediscovery and the attempt get what
+     * is left, even when that is less than another delay.
+     */
+    public function test_a_retry_sleep_that_overshoots_within_the_deadline_still_rediscovers(): void
+    {
+        $clock = new FakeClock(sleepOvershootMs: 20);
+        $operations = 0;
+        $rediscoveries = 0;
+
+        $result = (new SentinelRetryPolicy($this->logger, 3, 50, 100, clock: $clock))->run(
+            function () use (&$operations): string {
+                if (++$operations === 1) {
+                    throw new RedisException('Connection refused');
+                }
+
+                return 'ok';
+            },
+            function () use (&$rediscoveries): void {
+                $rediscoveries++;
+            },
+            'test',
+        );
+
+        // 70 ms in, 30 ms left: less than the 50 ms delay, but enough for the attempt the delay was waited for.
+        $this->assertSame('ok', $result);
+        $this->assertSame(1, $rediscoveries);
+        $this->assertSame(2, $operations);
+    }
+
+    /**
      * Rediscovery runs on its own clocks, and the deadline used to be checked only before it: a rediscovery that
      * outlived the budget was followed by another attempt anyway.
      * It now ends the loop, with the attempt it was preparing never started.

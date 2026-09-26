@@ -170,6 +170,11 @@ final class SentinelRetryPolicy
                     $this->clock->sleep($this->delayMs);
                 }
 
+                // A sleep only promises a minimum: one that ran past the deadline starts no rediscovery.
+                if ($deadline?->spent()) {
+                    throw $this->exhausted($context, $attempts, $this->elapsedMs($startedAt), $exception);
+                }
+
                 $onRetry($deadline);
 
                 if ($deadline?->spent()) {

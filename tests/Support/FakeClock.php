@@ -10,10 +10,8 @@ use ValueError;
 /**
  * A clock that only moves when told to, so a test can put a deadline at an exact instant.
  *
- * Sleeping advances it by the time slept and returns at once.
- *
- * Starts an hour in rather than at zero, as hrtime() does (it counts from an arbitrary point, in practice uptime):
- * at zero, code that passes 0 or a duration where a reading belongs would pass every test.
+ * sleep() returns at once, advancing by the time asked plus any overshoot set, as a real sleep may run long.
+ * It starts an hour in, not at zero, so code that passes 0 where a clock reading belongs fails its tests.
  */
 final class FakeClock implements MonotonicClock
 {
@@ -22,7 +20,15 @@ final class FakeClock implements MonotonicClock
      */
     private const int DEFAULT_START = 3_600_000_000_000;
 
-    public function __construct(private int $now = self::DEFAULT_START) {}
+    /**
+     * @param  int  $sleepOvershootMs  How much longer than asked every sleep() takes.
+     */
+    public function __construct(private int $now = self::DEFAULT_START, private readonly int $sleepOvershootMs = 0)
+    {
+        if ($sleepOvershootMs < 0) {
+            throw new ValueError('A sleep cannot overshoot by a negative duration.');
+        }
+    }
 
     public function now(): int
     {
@@ -32,6 +38,7 @@ final class FakeClock implements MonotonicClock
     public function sleep(int $milliseconds): void
     {
         $this->advance($milliseconds);
+        $this->advance($this->sleepOvershootMs);
     }
 
     /**
