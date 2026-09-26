@@ -7,14 +7,15 @@ namespace Tgi\LaravelPhpRedisSentinel\Exceptions;
 use RedisException;
 
 /**
- * Master discovery failed: no configured sentinel could name a master right now.
+ * Finding the master failed: no sentinel named a usable one, the named node could not be verified as master,
+ * or the recovery deadline ran out before one of its setup stages could start.
  *
  * Whether that is worth retrying depends entirely on *why*, which is what `$anySentinelAnswered` records:
  *
  *  - no sentinel answered at all - the fleet is unreachable. Retrying changes nothing, so this fails fast,
  *    with every host it tried named in the message.
- *  - a sentinel answered but knows no master - an election is in flight. That resolves on its own, well inside
- *    the retry budget, so the retry policy treats it exactly like any other failover-class error.
+ *  - a sentinel answered, and there is no usable master yet: an election is in flight, a replica is still being
+ *    promoted, or the budget ran out mid-setup. The retry policy treats it like any other failover-class error.
  *
  * A RedisException like everything else this driver throws at the application; see
  * {@see SentinelFailoverException} for why.
@@ -24,8 +25,8 @@ use RedisException;
 final class SentinelDiscoveryException extends RedisException
 {
     /**
-     * @param  string  $message  Names every sentinel tried and why each one did not answer.
-     * @param  bool  $anySentinelAnswered  Whether at least one sentinel responded (an election, not an outage).
+     * @param  string  $message  Names the sentinels tried, or the node, and why no usable master came of it.
+     * @param  bool  $anySentinelAnswered  Whether a sentinel responded, making it retryable (not an outage).
      */
     public function __construct(string $message, public readonly bool $anySentinelAnswered = false)
     {

@@ -192,7 +192,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * Run the operation, rediscovering the master and retrying on failover-class errors.
      *
-     * Every attempt, the first included, runs with the read timeout cut to what the deadline has left.
+     * Under a deadline, every attempt, the first included, runs with the read timeout cut to what is left.
      * A stale client rebuilt on the way in that spent the deadline doing so ends the operation before the command runs.
      *
      * @template TResult
@@ -201,7 +201,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * @param  SentinelRetryPolicy|null  $policy  Overrides the connection's budget, for blocking operations.
      * @return TResult
      *
-     * @throws SentinelFailoverException When the retry budget is spent (the original error as previous).
+     * @throws SentinelFailoverException When the retry budget is spent (the last failure as previous, if any).
      * @throws Throwable When the error is not failover-class (propagated untouched).
      */
     private function retryOnFailure(callable $callback, ?SentinelRetryPolicy $policy = null): mixed

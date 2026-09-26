@@ -11,9 +11,9 @@ use Tgi\LaravelPhpRedisSentinel\Support\HostListParser;
 /**
  * Builds RedisSentinel clients from a `database.redis.*` connection configuration.
  *
- * Everything that talks to the sentinels goes through here, so host parsing, ACL semantics and the probe timeout
- * are defined once. Used by the connector to discover the master, and by applications that inspect the sentinel
- * fleet with the same settings.
+ * Everything that talks to the sentinels goes through here, so host parsing and ACL semantics are defined once.
+ * The probe timeout's 0.5 s default is also in the connector, which cuts it to the recovery deadline.
+ * Used by the connector to discover the master, and by applications that inspect the sentinel fleet with the same settings.
  *
  * @api
  */

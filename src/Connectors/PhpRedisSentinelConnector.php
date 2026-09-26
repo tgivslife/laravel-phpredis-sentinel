@@ -27,7 +27,8 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
  * process, so the connections of one request pay for one sentinel round trip.
  *
  * Opening the connection runs in the retry budget too: php-fpm reconnects on every request, so a request during
- * an election fails while connecting. Only a fleet where no sentinel answers fails at once, naming every host tried.
+ * an election fails while connecting. A fleet where no sentinel answers fails at once, naming every host tried, as
+ * do configuration errors and errors that are not failover-class.
  *
  * @internal
  */
@@ -104,8 +105,8 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     /**
      * Create a connection to the current master.
      *
-     * The connection keeps a client factory that rediscovers unless called with `false`, which only the first connect
-     * does; Laravel's own closure pins the address it started with, which after a failover is the old master.
+     * The connection keeps a client factory that rediscovers unless called with `false`, which only the first attempt
+     * of each connect() does; Laravel's closure pins the address it started with, after a failover the old master.
      *
      * @param  array<string, mixed>  $config  The connection configuration (a `database.redis.*` entry).
      * @param  array<string, mixed>  $options  The `database.redis.options` array.
