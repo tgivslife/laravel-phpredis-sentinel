@@ -104,8 +104,8 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     /**
      * Create a connection to the current master.
      *
-     * The connection keeps a client factory that rediscovers when called with `true`; Laravel's own closure pins the
-     * address it started with, which after a failover is the old master.
+     * The connection keeps a client factory that rediscovers unless called with `false`, which only the first connect
+     * does; Laravel's own closure pins the address it started with, which after a failover is the old master.
      *
      * @param  array<string, mixed>  $config  The connection configuration (a `database.redis.*` entry).
      * @param  array<string, mixed>  $options  The `database.redis.options` array.
@@ -125,7 +125,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             $formattedOptions['prefix'] = $config['prefix'];
         }
 
-        $connector = function (bool $refresh = false, ?RecoveryDeadline $deadline = null) use ($config, $options, $formattedOptions): Redis {
+        $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use ($config, $options, $formattedOptions): Redis {
             [$host, $port] = $this->resolveMaster($config, $refresh, $deadline);
 
             $clientConfig = array_merge(

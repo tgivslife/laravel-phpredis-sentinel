@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Connectors;
 
 use Closure;
+use Illuminate\Redis\Connections\PhpRedisConnection;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Redis;
 use RedisException;
 use RedisSentinel;
+use ReflectionProperty;
 use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
@@ -449,6 +451,28 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertSame(['10.0.0.9:6380', '10.0.0.2:6381'], $this->clientHosts, 'the cached master first, then a rediscovery');
         $this->assertSame(1, $this->discoveries);
         $this->assertInstanceOf(PhpRedisSentinelConnection::class, $connection);
+    }
+
+    /**
+     * Laravel's own rebuild paths call the connector with no argument; a future one would reconnect to the cached,
+     * possibly demoted, master. Called that way the connector rediscovers instead, with the role check.
+     */
+    public function test_an_argument_less_connector_call_rediscovers_instead_of_reusing_the_cached_master(): void
+    {
+        $answers = [['10.0.0.9', '6380'], ['10.0.0.2', '6381']];
+
+        $connection = $this->connector(['s1:26379' => static function () use (&$answers): mixed {
+            return array_shift($answers);
+        }])->connect($this->config('s1:26379'), []);
+
+        $connector = (new ReflectionProperty(PhpRedisConnection::class, 'connector'))->getValue($connection);
+        $this->assertInstanceOf(Closure::class, $connector);
+
+        $connector();
+
+        $this->assertSame(2, $this->discoveries, 'the sentinels are asked again, not the cache');
+        $this->assertSame(['10.0.0.9:6380', '10.0.0.2:6381'], $this->clientHosts);
+        $this->assertSame(1, $this->clients[1]->infoCalls, 'a rediscovered node gets the role check');
     }
 
     public function test_connect_retries_until_the_election_names_a_master(): void
