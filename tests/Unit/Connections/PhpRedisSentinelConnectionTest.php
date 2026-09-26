@@ -389,6 +389,52 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         };
     }
 
+    /**
+     * A client with a serializer and a compressor: after its first $after commands, the next $failures fail with a
+     * lost connection. Every command is recorded with the serializer and compressor in force when it ran.
+     */
+    private function packingClient(int $failures = 0, int $after = 0): object
+    {
+        return new class($failures, $after)
+        {
+            /** @var list<array{string, int, int}> Every command: its name, serializer and compressor. */
+            public array $commands = [];
+
+            /** @var array<int, int> The options this client holds, as phpredis numbers them. */
+            public array $options = [Redis::OPT_SERIALIZER => Redis::SERIALIZER_PHP, Redis::OPT_COMPRESSION => 1];
+
+            public function __construct(private int $failures, private readonly int $after) {}
+
+            /**
+             * @param  list<mixed>  $arguments
+             */
+            public function __call(string $method, array $arguments): mixed
+            {
+                $this->commands[] = [$method, $this->options[Redis::OPT_SERIALIZER], $this->options[Redis::OPT_COMPRESSION]];
+
+                if (count($this->commands) > $this->after && $this->failures-- > 0) {
+                    throw new RedisException('Connection lost');
+                }
+
+                return 1;
+            }
+
+            public function getOption(int $option): int|float
+            {
+                return $option === Redis::OPT_READ_TIMEOUT ? 2.0 : ($this->options[$option] ?? 0);
+            }
+
+            public function setOption(int $option, mixed $value): bool
+            {
+                if ($option !== Redis::OPT_READ_TIMEOUT && is_int($value)) {
+                    $this->options[$option] = $value;
+                }
+
+                return true;
+            }
+        };
+    }
+
     public function test_subscriptions_get_blocking_retry_semantics(): void
     {
         // A 1 ms deadline against a 10 ms delay: a command gets no retries, a subscription is not charged for it.
@@ -1302,5 +1348,90 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         $connection->scan($cursor);
 
         $this->assertSame([$sent], $healthy->cursors);
+    }
+
+    /**
+     * Laravel's RateLimiter writes its counters raw inside withoutSerializationOrCompression(), with the SETEX of
+     * RedisStore::put() among others. A failover inside the callback replaces the client: the retried SETEX must run
+     * raw too, or phpredis serializes the counter and the next INCR fails on it, and the options must come back on
+     * the client the connection holds afterwards, not on the one it dropped.
+     */
+    public function test_a_client_replaced_inside_without_serialization_or_compression_is_packed_raw_too(): void
+    {
+        $client = $this->packingClient(failures: 1);
+        $replacement = $this->packingClient();
+        $refreshes = [];
+        $connection = $this->connection($client, $replacement, $refreshes);
+
+        $connection->withoutSerializationOrCompression(fn () => $connection->command('setex', ['limiter', 60, 1]));
+
+        $this->assertSame([true], $refreshes);
+        $this->assertSame([['setex', Redis::SERIALIZER_NONE, Redis::COMPRESSION_NONE]], $replacement->commands);
+        $this->assertSame([Redis::OPT_SERIALIZER => Redis::SERIALIZER_PHP, Redis::OPT_COMPRESSION => 1], $replacement->options);
+    }
+
+    public function test_without_serialization_or_compression_keeps_laravels_behaviour_without_a_failover(): void
+    {
+        $client = $this->packingClient();
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $connection->withoutSerializationOrCompression(fn () => $connection->command('setex', ['limiter', 60, 1]));
+
+        $this->assertSame([['setex', Redis::SERIALIZER_NONE, Redis::COMPRESSION_NONE]], $client->commands);
+        $this->assertSame([Redis::OPT_SERIALIZER => Redis::SERIALIZER_PHP, Redis::OPT_COMPRESSION => 1], $client->options);
+    }
+
+    public function test_a_nested_call_leaves_the_outer_one_raw_until_it_ends(): void
+    {
+        $client = $this->packingClient(failures: 1);
+        $replacement = $this->packingClient();
+        $refreshes = [];
+        $connection = $this->connection($client, $replacement, $refreshes);
+
+        $connection->withoutSerializationOrCompression(function () use ($connection): void {
+            $connection->withoutSerializationOrCompression(fn () => $connection->command('get', ['limiter']));
+            $connection->command('setex', ['limiter', 60, 1]);
+        });
+
+        $this->assertSame(
+            [['get', Redis::SERIALIZER_NONE, Redis::COMPRESSION_NONE], ['setex', Redis::SERIALIZER_NONE, Redis::COMPRESSION_NONE]],
+            $replacement->commands,
+        );
+        $this->assertSame(Redis::SERIALIZER_PHP, $replacement->options[Redis::OPT_SERIALIZER]);
+    }
+
+    public function test_the_options_come_back_on_the_current_client_when_the_callback_throws(): void
+    {
+        $client = $this->packingClient(failures: 1);
+        $replacement = $this->packingClient();
+        $refreshes = [];
+        $connection = $this->connection($client, $replacement, $refreshes);
+
+        try {
+            $connection->withoutSerializationOrCompression(function () use ($connection): never {
+                $connection->command('setex', ['limiter', 60, 1]);
+
+                throw new RuntimeException('the callback failed');
+            });
+        } catch (RuntimeException) {
+            // As expected.
+        }
+
+        $this->assertSame([Redis::OPT_SERIALIZER => Redis::SERIALIZER_PHP, Redis::OPT_COMPRESSION => 1], $replacement->options);
+    }
+
+    public function test_a_client_replaced_after_the_callback_keeps_its_packing(): void
+    {
+        $client = $this->packingClient(failures: 1, after: 1);
+        $replacement = $this->packingClient();
+        $refreshes = [];
+        $connection = $this->connection($client, $replacement, $refreshes);
+
+        $connection->withoutSerializationOrCompression(fn () => $connection->command('setex', ['limiter', 60, 1]));
+        $connection->command('get', ['cached']);
+
+        $this->assertSame([true], $refreshes);
+        $this->assertSame([['get', Redis::SERIALIZER_PHP, 1]], $replacement->commands);
     }
 }

@@ -57,6 +57,14 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     private bool $clientIsStale = false;
 
     /**
+     * While withoutSerializationOrCompression() runs, the phpredis options it turned off, keyed by option, with the
+     * values to restore; a client that replaces the current one mid-callback gets them turned off too.
+     *
+     * @var array<int, mixed>|null
+     */
+    private ?array $unpackedOptions = null;
+
+    /**
      * The connector, kept with its real signature: Laravel's `$connector` property is documented as a bare callable.
      *
      * @var (Closure(bool=, ?RecoveryDeadline=): Redis)|null
@@ -206,6 +214,39 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * {@inheritdoc}
      *
+     * Laravel turns the options off on the client it holds at the start and restores them on that client, but a
+     * failover inside the callback replaces it: the retried command would run packed, and the restore would go to
+     * the dropped client. Here the replacement gets them turned off too, and the restore goes to the current client.
+     * A nested call finds them off already and leaves them to the outer one.
+     */
+    public function withoutSerializationOrCompression(callable $callback)
+    {
+        $unpacked = array_filter([
+            Redis::OPT_SERIALIZER => $this->serialized() ? $this->client->getOption(Redis::OPT_SERIALIZER) : null,
+            Redis::OPT_COMPRESSION => $this->compressed() ? $this->client->getOption(Redis::OPT_COMPRESSION) : null,
+        ], static fn (mixed $value): bool => $value !== null);
+
+        if ($unpacked === []) {
+            return $callback();
+        }
+
+        $this->unpackedOptions = $unpacked;
+        $this->unpack();
+
+        try {
+            return $callback();
+        } finally {
+            $this->unpackedOptions = null;
+
+            foreach ($unpacked as $option => $value) {
+                $this->client->setOption($option, $value);
+            }
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     *
      * Runs the callback once. Laravel retries opening a pipeline or transaction on a client rebuilt from the cached
      * address; inside retryOnFailure() that would nest a second loop that never rediscovers the master.
      */
@@ -348,6 +389,22 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
                 $this->getName() ?? 'unknown',
                 $exception->getMessage(),
             ));
+
+            return;
+        }
+
+        if ($this->unpackedOptions !== null) {
+            $this->unpack();
+        }
+    }
+
+    /**
+     * Turn off, on the current client, the options withoutSerializationOrCompression() has turned off.
+     */
+    private function unpack(): void
+    {
+        foreach (array_keys($this->unpackedOptions ?? []) as $option) {
+            $this->client->setOption($option, $option === Redis::OPT_SERIALIZER ? Redis::SERIALIZER_NONE : Redis::COMPRESSION_NONE);
         }
     }
 
