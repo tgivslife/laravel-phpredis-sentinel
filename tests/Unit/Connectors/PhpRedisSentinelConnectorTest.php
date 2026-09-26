@@ -59,6 +59,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
      * @param  list<string>  $noInfoHosts  Hosts whose INFO returns false instead of an array.
      * @param  list<string>  $infoErrorHosts  Hosts whose INFO throws.
      * @param  array<string, int>  $buildMs  host => how far building its client moves the clock.
+     * @param  array<string, int>  $commandMs  auth, select, client or info => how far each call moves the clock.
      */
     private function connector(
         array $sentinels,
@@ -68,6 +69,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         array $noInfoHosts = [],
         array $infoErrorHosts = [],
         array $buildMs = [],
+        array $commandMs = [],
     ): PhpRedisSentinelConnector {
         $sentinelClient = function (string $host, int $port, array $config) use ($sentinels): RedisSentinel {
             $this->discoveries++;
@@ -88,7 +90,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         };
 
         $dataClient = function (array $config) use (
-            $deadMasters, $replicaHosts, $deadConnectMs, $noInfoHosts, $infoErrorHosts, $buildMs,
+            $deadMasters, $replicaHosts, $deadConnectMs, $noInfoHosts, $infoErrorHosts, $buildMs, $commandMs,
         ): Redis {
             $this->clientHosts[] = "{$config['host']}:{$config['port']}";
             $this->clientConfigs[] = $config;
@@ -107,7 +109,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 default => 'master',
             };
 
-            return $this->clients[] = new class($role) extends Redis
+            return $this->clients[] = new class($role, $this->clock, $commandMs) extends Redis
             {
                 /** @var list<float> Every value OPT_READ_TIMEOUT was set to, in order. */
                 public array $readTimeouts = [];
@@ -117,25 +119,32 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 /** @var list<list<mixed>> Every setup command and INFO sent, in order, with its arguments. */
                 public array $calls = [];
 
-                public function __construct(private readonly ?string $role) {}
+                /**
+                 * @param  array<string, int>  $commandMs
+                 */
+                public function __construct(
+                    private readonly ?string $role,
+                    private readonly FakeClock $clock,
+                    private readonly array $commandMs,
+                ) {}
 
                 public function auth(mixed $credentials): Redis|bool
                 {
-                    $this->calls[] = ['auth', $credentials];
+                    $this->sent('auth', $credentials);
 
                     return true;
                 }
 
                 public function select(int $db): Redis|bool
                 {
-                    $this->calls[] = ['select', $db];
+                    $this->sent('select', $db);
 
                     return true;
                 }
 
                 public function client(string $opt, mixed ...$args): mixed
                 {
-                    $this->calls[] = ['client', $opt, ...$args];
+                    $this->sent('client', $opt, ...$args);
 
                     return true;
                 }
@@ -146,7 +155,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 public function info(string ...$sections): array|false
                 {
                     $this->infoCalls++;
-                    $this->calls[] = ['info', ...$sections];
+                    $this->sent('info', ...$sections);
 
                     if ($this->role === 'error') {
                         throw new RedisException('ERR the INFO reply could not be read');
@@ -167,6 +176,15 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 public function close(): bool
                 {
                     return true;
+                }
+
+                /**
+                 * Record a command, then let it take its scripted time.
+                 */
+                private function sent(string $command, mixed ...$arguments): void
+                {
+                    $this->calls[] = [$command, ...$arguments];
+                    $this->clock->advance($this->commandMs[$command] ?? 0);
                 }
             };
         };
@@ -568,10 +586,97 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             $this->assertSame(['10.0.0.7:6380', '10.0.0.9:6380'], $this->clientHosts);
             $this->assertSame(0, $this->clients[0]->infoCalls, 'no role check may start on a spent budget');
             $this->assertStringContainsString(
-                'spent before the role of [10.0.0.9:6380] could be verified',
+                'spent before the role check of [10.0.0.9:6380]',
                 $exception->getPrevious()?->getMessage() ?? '',
             );
         }
+    }
+
+    /**
+     * @return array<string, array{array<string, int>, array<string, int>, list<string>, string}>
+     */
+    public static function stagesAfterASpentBudget(): array
+    {
+        return [
+            'AUTH' => [['10.0.0.9' => 150], [], [], 'before AUTH on [10.0.0.9:6380]'],
+            'SELECT' => [[], ['auth' => 150], ['auth'], 'before SELECT on [10.0.0.9:6380]'],
+            'CLIENT SETNAME' => [[], ['select' => 150], ['auth', 'select'], 'before CLIENT SETNAME on [10.0.0.9:6380]'],
+            'role check' => [[], ['client' => 150], ['auth', 'select', 'client'], 'before the role check of [10.0.0.9:6380]'],
+        ];
+    }
+
+    /**
+     * Each setup stage is a round trip of its own: once the stages before it have spent the budget it does not
+     * start, the error names it, and the client gets its configured read timeout back.
+     *
+     * @param  array<string, int>  $buildMs
+     * @param  array<string, int>  $commandMs
+     * @param  list<string>  $sent
+     */
+    #[DataProvider('stagesAfterASpentBudget')]
+    public function test_no_setup_stage_starts_once_the_budget_is_spent(
+        array $buildMs,
+        array $commandMs,
+        array $sent,
+        string $stage,
+    ): void {
+        $config = $this->config('s1:26379', [
+            'password' => 'secret', 'database' => 2, 'name' => 'worker', 'read_timeout' => 2.0, 'retry_deadline' => 100,
+        ]);
+
+        // A connection before the failover caches 10.0.0.7, which then dies: the next connect rediscovers.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+        $this->forgetRecordings();
+
+        $connector = $this->connector(
+            ['s1:26379' => static fn (): array => ['10.0.0.9', '6380']],
+            deadMasters: ['10.0.0.7'],
+            buildMs: $buildMs,
+            commandMs: $commandMs,
+        );
+
+        try {
+            $connector->connect($config, []);
+            $this->fail('Expected the spent budget to end the connect.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame($sent, array_column($this->clients[0]->calls, 0));
+            $this->assertStringContainsString(
+                "The recovery deadline was spent {$stage}",
+                $exception->getPrevious()?->getMessage() ?? '',
+            );
+            $this->assertSame(2.0, end($this->clients[0]->readTimeouts), 'the configured read timeout comes back');
+        }
+    }
+
+    public function test_a_configured_read_timeout_shorter_than_what_is_left_is_kept_for_each_stage(): void
+    {
+        // The default 5 s deadline leaves far more than 0.5 s: every stage waits the configured 0.5 s, never longer.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', ['password' => 'secret', 'database' => 2, 'read_timeout' => 0.5]), []);
+
+        $this->assertSame([0.5, 0.5, 0.5], $this->clients[0]->readTimeouts, 'AUTH, SELECT, then the restore');
+    }
+
+    public function test_each_setup_stage_waits_at_most_what_the_stages_before_it_left(): void
+    {
+        $config = $this->config('s1:26379', [
+            'password' => 'secret', 'database' => 2, 'name' => 'worker', 'read_timeout' => 2.0, 'retry_deadline' => 100,
+        ]);
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+        $this->forgetRecordings();
+
+        $this->connector(
+            ['s1:26379' => static fn (): array => ['10.0.0.9', '6380']],
+            deadMasters: ['10.0.0.7'],
+            commandMs: ['auth' => 30, 'select' => 20, 'client' => 10],
+        )->connect($config, []);
+
+        $this->assertSame(
+            [0.1, 0.07, 0.05, 0.04, 2.0],
+            $this->clients[0]->readTimeouts,
+            'AUTH, SELECT, SETNAME and the role check each get what is left, then the configured value comes back',
+        );
     }
 
     public function test_the_role_check_stays_off_the_happy_path(): void
@@ -684,7 +789,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             [$this->clientConfigs[1]['timeout'], $this->clientConfigs[1]['read_timeout']],
             'the rediscovery gets what is left, never more',
         );
-        $this->assertSame([2.0], $this->clients[0]->readTimeouts, 'restored after the role check');
+        $this->assertSame([0.07, 2.0], $this->clients[0]->readTimeouts, 'clamped for the role check, then restored');
     }
 
     public function test_cluster_connections_are_refused_with_a_named_error(): void

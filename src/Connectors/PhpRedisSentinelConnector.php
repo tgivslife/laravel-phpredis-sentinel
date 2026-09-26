@@ -138,10 +138,12 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             );
 
             try {
-                $this->sendSetupCommands($client, $clientConfig);
+                $this->sendSetupCommands($client, $clientConfig, $deadline, "{$host}:{$port}");
 
                 if ($refresh) {
-                    $this->assertMaster($client, $host, $port, $deadline);
+                    $this->stage($client, $clientConfig, $deadline, "the role check of [{$host}:{$port}]", function () use ($client, $host, $port): void {
+                        $this->assertMaster($client, $host, $port);
+                    });
                 }
             } finally {
                 if ($deadline !== null) {
@@ -206,20 +208,59 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * which changes nothing: their arguments are never serialized, compressed or prefixed.
      *
      * @param  array<array-key, mixed>  $config
+     *
+     * @throws SentinelDiscoveryException Retryable: the deadline was spent before a stage started.
+     * @throws RuntimeException When a credential or the database is not a scalar.
      */
-    private function sendSetupCommands(Redis $client, array $config): void
+    private function sendSetupCommands(Redis $client, array $config, ?RecoveryDeadline $deadline, string $node): void
     {
         if (! empty($config['password'])) {
-            $client->auth(self::credentials($config));
+            $credentials = self::credentials($config);
+
+            $this->stage($client, $config, $deadline, "AUTH on [{$node}]", static function () use ($client, $credentials): void {
+                $client->auth($credentials);
+            });
         }
 
         if (isset($config['database'])) {
-            $client->select(self::intSetting($config, 'database'));
+            $database = self::intSetting($config, 'database');
+
+            $this->stage($client, $config, $deadline, "SELECT on [{$node}]", static function () use ($client, $database): void {
+                $client->select($database);
+            });
         }
 
         if (! empty($config['name'])) {
-            $client->client('SETNAME', $config['name']);
+            $name = $config['name'];
+
+            $this->stage($client, $config, $deadline, "CLIENT SETNAME on [{$node}]", static function () use ($client, $name): void {
+                $client->client('SETNAME', $name);
+            });
         }
+    }
+
+    /**
+     * One setup round trip: refused once the deadline is spent, otherwise its read waits at most what is left.
+     *
+     * @param  array<array-key, mixed>  $config
+     * @param  Closure(): void  $run
+     *
+     * @throws SentinelDiscoveryException Retryable, so the retry policy decides; on a spent budget it gives up.
+     */
+    private function stage(Redis $client, array $config, ?RecoveryDeadline $deadline, string $name, Closure $run): void
+    {
+        if ($deadline !== null) {
+            if ($deadline->spent()) {
+                throw new SentinelDiscoveryException(
+                    "The recovery deadline was spent before {$name}",
+                    anySentinelAnswered: true,
+                );
+            }
+
+            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(self::floatSetting($config, 'read_timeout', 0.0)));
+        }
+
+        $run();
     }
 
     /**
@@ -266,21 +307,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * Only on rediscovery, so the happy path costs nothing: sentinels switch before the old master finishes demoting,
      * and a replica answers reads, so the mistake would otherwise stay hidden until the next write.
      *
-     * No check starts once the deadline is spent: INFO is a round trip the budget cannot cover, and an unverified
-     * node is refused rather than handed out as the master.
-     *
-     * @throws SentinelDiscoveryException Retryable: the promotion has not landed yet, or was not checked in time.
+     * @throws SentinelDiscoveryException Retryable: the promotion has not landed yet.
      */
-    private function assertMaster(Redis $client, string $host, int $port, ?RecoveryDeadline $deadline): void
+    private function assertMaster(Redis $client, string $host, int $port): void
     {
         $node = "{$host}:{$port}";
-
-        if ($deadline?->spent()) {
-            throw new SentinelDiscoveryException(
-                "The recovery deadline was spent before the role of [{$node}] could be verified",
-                anySentinelAnswered: true,
-            );
-        }
 
         try {
             $info = $client->info('replication');
