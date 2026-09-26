@@ -19,14 +19,12 @@ use Throwable;
 /**
  * A phpredis connection that survives a Sentinel failover inside the failing command.
  *
- * Laravel's own recovery rebuilds the client from the address it already has, which after a failover is the old master.
- * Here every entry point that talks to the client directly runs in the retry policy's loop instead, and a retry rebuilds
- * the client through the connector with a forced rediscovery.
- * Every other command - `__call`, `eval`, `flushdb` and the rest - already goes through command(), and wrapping it again would nest two loops.
- * A blocking pop with a finite timeout reads under it plus headroom, so a healthy wait is not taken for a failover,
- * and one with no timeout waits in slices of the read timeout.
+ * Laravel's own recovery reconnects to the address it already has, which after a failover is the old master.
+ * Here each method that talks to the client runs in the retry policy's loop, and a retry rediscovers the master first.
+ * The rest (`__call`, `eval`, `flushdb`, …) already goes through command(), and wrapping it again would nest two loops.
+ * A blocking pop waits out its own timeout (without one, in slices of the read timeout) instead of failing at the read timeout.
  *
- * A retried write whose reply was lost may run twice, and a retried pipeline replays the whole batch.
+ * A retry may repeat work: a write whose reply was lost, a whole pipeline, or the keys a scan already returned.
  *
  * @internal
  */
@@ -120,7 +118,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function scan($cursor, $options = [])
     {
-        return $this->retryOnFailure(fn () => parent::scan($cursor, $options));
+        return $this->retryScan($cursor, fn ($cursor) => parent::scan($cursor, $options));
     }
 
     /**
@@ -130,7 +128,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function zscan($key, $cursor, $options = [])
     {
-        return $this->retryOnFailure(fn () => parent::zscan($key, $cursor, $options));
+        return $this->retryScan($cursor, fn ($cursor) => parent::zscan($key, $cursor, $options));
     }
 
     /**
@@ -140,7 +138,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function hscan($key, $cursor, $options = [])
     {
-        return $this->retryOnFailure(fn () => parent::hscan($key, $cursor, $options));
+        return $this->retryScan($cursor, fn ($cursor) => parent::hscan($key, $cursor, $options));
     }
 
     /**
@@ -150,7 +148,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     public function sscan($key, $cursor, $options = [])
     {
-        return $this->retryOnFailure(fn () => parent::sscan($key, $cursor, $options));
+        return $this->retryScan($cursor, fn ($cursor) => parent::sscan($key, $cursor, $options));
     }
 
     /**
@@ -275,6 +273,43 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
             throw $exception;
         }
+    }
+
+    /**
+     * Run one scan page, restarting from the start cursor on any attempt that may reach another server.
+     *
+     * A cursor is a position in one server's hash table, and each Redis process seeds its hash at random, so after a
+     * retry, or a stale client rebuilt on the way in, the scan starts over and the caller's loop carries on from the
+     * new cursor. Keys already returned may come back. 0 is left as it is: it ends a scan without asking Redis.
+     *
+     * @template TResult
+     *
+     * @param  callable(mixed): TResult  $scan  Runs one page from the given cursor.
+     * @return TResult
+     */
+    private function retryScan(mixed $cursor, callable $scan): mixed
+    {
+        $client = $this->client;
+        $attempts = 0;
+        $warned = false;
+
+        // The start value and a finished scan have nothing to restart.
+        $midIteration = ! in_array($cursor, [null, 0, '0'], true);
+
+        return $this->retryOnFailure(function () use ($cursor, $scan, $client, $midIteration, &$attempts, &$warned) {
+            $restart = $midIteration && ($attempts++ > 0 || $this->client !== $client);
+
+            // Every retry is logged already; the restart once per call.
+            if ($restart && ! $warned) {
+                $warned = true;
+                $this->logger->warning(sprintf(
+                    'Redis sentinel connection [%s]: scan restarted from the start cursor, as its server may have changed; keys already returned may come back',
+                    $this->getName() ?? 'unknown',
+                ));
+            }
+
+            return $scan($restart ? null : $cursor);
+        });
     }
 
     /**

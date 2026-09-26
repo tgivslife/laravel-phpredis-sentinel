@@ -310,6 +310,85 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         };
     }
 
+    /**
+     * A client whose scans follow a script, one step per call: each step throws ('throw'), or moves the cursor to
+     * 'next' and returns 'keys'. Every cursor a scan was called with is recorded.
+     *
+     * @param  list<array{throw?: string, next?: int, keys?: list<string>}>  $script
+     */
+    private function scanClient(array $script): object
+    {
+        return new class($script)
+        {
+            /** @var list<int|string|null> The cursor of every scan call, in order. */
+            public array $cursors = [];
+
+            /**
+             * @param  list<array{throw?: string, next?: int, keys?: list<string>}>  $script
+             */
+            public function __construct(private array $script) {}
+
+            /**
+             * @return list<string>
+             */
+            public function scan(int|string|null &$cursor, ?string $pattern = null, int $count = 0): array
+            {
+                return $this->page($cursor);
+            }
+
+            /**
+             * @return list<string>
+             */
+            public function zscan(string $key, int|string|null &$cursor, ?string $pattern = null, int $count = 0): array
+            {
+                return $this->page($cursor);
+            }
+
+            /**
+             * @return list<string>
+             */
+            public function hscan(string $key, int|string|null &$cursor, ?string $pattern = null, int $count = 0): array
+            {
+                return $this->page($cursor);
+            }
+
+            /**
+             * @return list<string>
+             */
+            public function sscan(string $key, int|string|null &$cursor, ?string $pattern = null, int $count = 0): array
+            {
+                return $this->page($cursor);
+            }
+
+            public function getOption(int $option): float
+            {
+                return $option === Redis::OPT_READ_TIMEOUT ? 2.0 : 0.0;
+            }
+
+            public function setOption(int $option, mixed $value): bool
+            {
+                return true;
+            }
+
+            /**
+             * @return list<string>
+             */
+            private function page(int|string|null &$cursor): array
+            {
+                $this->cursors[] = $cursor;
+                $step = array_shift($this->script) ?? [];
+
+                if (isset($step['throw'])) {
+                    throw new RedisException($step['throw']);
+                }
+
+                $cursor = $step['next'] ?? 0;
+
+                return $step['keys'] ?? [];
+            }
+        };
+    }
+
     public function test_subscriptions_get_blocking_retry_semantics(): void
     {
         // A 1 ms deadline against a 10 ms delay: a command gets no retries, a subscription is not charged for it.
@@ -1092,5 +1171,136 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
         $this->assertSame([['q'], $slice], $client->calls[0][1]);
         $this->assertSame($slice + $slice, $client->calls[0][2], 'the slice plus the same headroom');
+    }
+
+    /**
+     * @return array<string, array{string, list<mixed>}>
+     */
+    public static function scans(): array
+    {
+        return [
+            // method, the arguments before the cursor
+            'scan' => ['scan', []],
+            'zscan' => ['zscan', ['z']],
+            'hscan' => ['hscan', ['h']],
+            'sscan' => ['sscan', ['s']],
+        ];
+    }
+
+    /**
+     * @param  list<mixed>  $before
+     */
+    #[DataProvider('scans')]
+    public function test_a_scan_that_fails_at_the_start_cursor_retries_it(string $method, array $before): void
+    {
+        $client = $this->scanClient([['throw' => 'Connection lost'], ['next' => 5, 'keys' => ['a']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $this->assertSame([5, ['a']], $connection->{$method}(...[...$before, null]));
+        $this->assertSame([null, null], $client->cursors);
+        $this->assertSame([true], $refreshes);
+        $this->assertCount(1, $this->logger->warnings(), 'the retry only: nothing was restarted');
+    }
+
+    /**
+     * A cursor is a position in one server's hash table, and each Redis process seeds its hash function at random:
+     * the old master's cursor means nothing on the new one, so the retry starts the scan over, and the caller's loop
+     * carries on from the new cursor.
+     *
+     * @param  list<mixed>  $before
+     */
+    #[DataProvider('scans')]
+    public function test_a_scan_that_fails_mid_iteration_restarts_from_the_start_cursor(string $method, array $before): void
+    {
+        $client = $this->scanClient([['throw' => 'Connection lost'], ['next' => 9, 'keys' => ['b']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $this->assertSame([9, ['b']], $connection->{$method}(...[...$before, 17]));
+        $this->assertSame([17, null], $client->cursors);
+        $this->assertCount(2, $this->logger->warnings());
+        $this->assertStringContainsString('restarted', $this->logger->warnings()[1]);
+    }
+
+    /**
+     * Every retry restarts, even on the old client when rediscovery failed: the server behind it may be a restarted process.
+     * The retries are logged each time already, so the restart is logged once per call.
+     */
+    public function test_a_scan_retried_twice_is_restarted_each_time_and_logged_once(): void
+    {
+        $client = $this->scanClient([
+            ['throw' => 'Connection lost'],
+            ['throw' => 'Connection lost'],
+            ['next' => 9, 'keys' => ['b']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes);
+
+        $this->assertSame([9, ['b']], $connection->scan(17));
+        $this->assertSame([17, null, null], $client->cursors);
+
+        $restarts = array_filter($this->logger->warnings(), static fn (string $warning): bool => str_contains($warning, 'restarted'));
+        $this->assertCount(1, $restarts);
+        $this->assertStringNotContainsString('new master', (string) reset($restarts));
+    }
+
+    public function test_a_restart_spends_retry_budget_like_any_other_attempt(): void
+    {
+        $client = $this->scanClient([['throw' => 'Connection lost'], ['throw' => 'Connection lost']]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, attempts: 1);
+
+        try {
+            $connection->scan(17);
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertStringContainsString('gave up after 1 retry', $exception->getMessage());
+            $this->assertSame([17, null], $client->cursors);
+        }
+    }
+
+    /**
+     * @return array<string, array{int|string, int|string|null}>
+     */
+    public static function cursorsOnARebuiltClient(): array
+    {
+        return [
+            // the caller's cursor, the cursor the rebuilt client gets
+            'mid-iteration' => [17, null],
+            'finished (0 ends a scan without asking Redis)' => [0, 0],
+            'finished, as a string' => ['0', '0'],
+        ];
+    }
+
+    /**
+     * A stale client rebuilt on the way into the scan puts even its first attempt on a new master.
+     */
+    #[DataProvider('cursorsOnARebuiltClient')]
+    public function test_a_scan_on_a_client_rebuilt_on_the_way_in_restarts_an_unfinished_cursor(
+        int|string $cursor,
+        int|string|null $sent,
+    ): void {
+        $dead = $this->scanClient([['throw' => 'Connection refused']]);
+        $healthy = $this->scanClient([['next' => 0, 'keys' => []]]);
+        $handOut = $dead;
+
+        $connector = function (bool $refresh = false) use (&$handOut): object {
+            return $handOut;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(0), $this->logger);
+
+        try {
+            $connection->scan(null);
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $handOut = $healthy;
+        $connection->scan($cursor);
+
+        $this->assertSame([$sent], $healthy->cursors);
     }
 }
