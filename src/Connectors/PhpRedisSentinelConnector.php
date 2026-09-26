@@ -54,6 +54,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     ];
 
     /**
+     * Settings removed from the config Laravel's createClient() receives, because the connector sends their commands
+     * itself: password (AUTH), database (SELECT) and name (CLIENT SETNAME).
+     *
+     * @var array<string, true>
+     */
+    private const array SETUP_COMMAND_KEYS = ['password' => true, 'database' => true, 'name' => true];
+
+    /**
      * Per-process master address cache: discovery cache key => [host, port].
      *
      * A stale entry costs one failed attempt before the retry rediscovers; no cross-process cache by design.
@@ -124,11 +132,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 self::withoutDiscoveryKeys($config), ['host' => $host, 'port' => $port], $options, $formattedOptions,
             );
 
-            // Connect, auth, SELECT and the role check wait under timeouts cut to what the deadline has left;
-            // the configured read timeout comes back afterwards, since this client serves every later command.
-            $client = ($this->clients)($this->clampClientTimeouts($clientConfig, $deadline));
+            // Setup runs under timeouts cut to the deadline; the configured read timeout returns for later commands.
+            $client = ($this->clients)(
+                $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $deadline),
+            );
 
             try {
+                $this->sendSetupCommands($client, $clientConfig);
+
                 if ($refresh) {
                     $this->assertMaster($client, $host, $port, $deadline);
                 }
@@ -186,6 +197,67 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         throw new RuntimeException(
             'A Sentinel connection cannot be a Redis Cluster: define the cluster under `clusters`, without sentinel_hosts.'
         );
+    }
+
+    /**
+     * AUTH, SELECT and CLIENT SETNAME, with rules copied from Laravel 13.33's PhpRedisConnector::createClient().
+     *
+     * Replies are ignored, as in Laravel. The commands follow the local options rather than running among them,
+     * which changes nothing: their arguments are never serialized, compressed or prefixed.
+     *
+     * @param  array<array-key, mixed>  $config
+     */
+    private function sendSetupCommands(Redis $client, array $config): void
+    {
+        if (! empty($config['password'])) {
+            $client->auth(self::credentials($config));
+        }
+
+        if (isset($config['database'])) {
+            $client->select(self::intSetting($config, 'database'));
+        }
+
+        if (! empty($config['name'])) {
+            $client->client('SETNAME', $config['name']);
+        }
+    }
+
+    /**
+     * The AUTH argument: [username, password], or the password alone; phpredis reads an array one as [user, pass].
+     *
+     * Scalars are cast to strings exactly as phpredis would convert them, so the bytes sent are unchanged.
+     *
+     * @param  array<array-key, mixed>  $config
+     * @return string|array<array-key, string>
+     *
+     * @throws RuntimeException When a credential is not a scalar.
+     */
+    private static function credentials(array $config): string|array
+    {
+        $username = $config['username'] ?? null;
+        $password = $config['password'] ?? null;
+
+        if ($username !== null && $username !== '' && is_string($password)) {
+            return [self::credential($username, 'username'), $password];
+        }
+
+        if (is_array($password)) {
+            return array_map(static fn (mixed $part): string => self::credential($part, 'password'), $password);
+        }
+
+        return self::credential($password, 'password');
+    }
+
+    /**
+     * @throws RuntimeException When the value is not a scalar.
+     */
+    private static function credential(mixed $value, string $key): string
+    {
+        if (! is_scalar($value)) {
+            throw new RuntimeException(sprintf('%s must be a string, %s given.', $key, get_debug_type($value)));
+        }
+
+        return (string) $value;
     }
 
     /**
@@ -403,6 +475,24 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         }
 
         return (string) $value;
+    }
+
+    /**
+     * An integer setting, cast as before; anything that is not a scalar is refused rather than cast.
+     *
+     * @param  array<array-key, mixed>  $config
+     *
+     * @throws RuntimeException When the setting is not a scalar.
+     */
+    private static function intSetting(array $config, string $key): int
+    {
+        $value = $config[$key] ?? 0;
+
+        if (! is_scalar($value)) {
+            throw new RuntimeException(sprintf('%s must be a number, %s given.', $key, get_debug_type($value)));
+        }
+
+        return (int) $value;
     }
 
     /**

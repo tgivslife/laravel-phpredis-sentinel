@@ -114,7 +114,31 @@ final class PhpRedisSentinelConnectorTest extends TestCase
 
                 public int $infoCalls = 0;
 
+                /** @var list<list<mixed>> Every setup command and INFO sent, in order, with its arguments. */
+                public array $calls = [];
+
                 public function __construct(private readonly ?string $role) {}
+
+                public function auth(mixed $credentials): Redis|bool
+                {
+                    $this->calls[] = ['auth', $credentials];
+
+                    return true;
+                }
+
+                public function select(int $db): Redis|bool
+                {
+                    $this->calls[] = ['select', $db];
+
+                    return true;
+                }
+
+                public function client(string $opt, mixed ...$args): mixed
+                {
+                    $this->calls[] = ['client', $opt, ...$args];
+
+                    return true;
+                }
 
                 /**
                  * @return array<string, string>|false
@@ -122,6 +146,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
                 public function info(string ...$sections): array|false
                 {
                     $this->infoCalls++;
+                    $this->calls[] = ['info', ...$sections];
 
                     if ($this->role === 'error') {
                         throw new RedisException('ERR the INFO reply could not be read');
@@ -230,6 +255,9 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             'sentinel_timeout' => [['sentinel_timeout' => []], 'sentinel_timeout must be a number, array given.'],
             'timeout' => [['timeout' => []], 'timeout must be a number, array given.'],
             'read_timeout' => [['read_timeout' => []], 'read_timeout must be a number, array given.'],
+            'database' => [['database' => []], 'database must be a number, array given.'],
+            'password entry' => [['password' => [['ops']]], 'password must be a string, array given.'],
+            'username' => [['username' => ['ops'], 'password' => 'secret'], 'username must be a string, array given.'],
         ];
     }
 
@@ -289,9 +317,82 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             $this->assertArrayNotHasKey($stripped, $client, "[{$stripped}] must not reach the data-node client");
         }
 
-        $this->assertSame('secret', $client['password'], 'the data-node credentials are not discovery keys');
-        $this->assertSame('2', $client['database']);
+        // The data-node credentials and database are not discovery keys: the connector sends them itself.
+        $this->assertArrayNotHasKey('password', $client);
+        $this->assertArrayNotHasKey('database', $client);
+        $this->assertSame([['auth', 'secret'], ['select', 2]], $this->clients[0]->calls);
         $this->assertSame(3, $client['max_retries']);
+    }
+
+    /**
+     * Laravel's createClient() still connects the client and applies every local option, but gets no password,
+     * database or name: the connector sends AUTH, SELECT and CLIENT SETNAME itself, after the options.
+     */
+    public function test_setup_commands_leave_createclient_and_run_in_laravels_order(): void
+    {
+        $config = $this->config('s1:26379', [
+            'password' => 'secret', 'database' => '2', 'name' => 'worker', 'username' => 'ops', 'prefix' => 'app:',
+        ]);
+
+        // A connection before the failover caches 10.0.0.7, which then dies: the next connect rediscovers.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+        $this->forgetRecordings();
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']], deadMasters: ['10.0.0.7'])
+            ->connect($config, ['serializer' => 1]);
+
+        foreach ($this->clientConfigs as $built) {
+            foreach (['password', 'database', 'name'] as $sent) {
+                $this->assertArrayNotHasKey($sent, $built, "[{$sent}] is sent by the connector, not createClient()");
+            }
+
+            $this->assertSame('ops', $built['username']);
+            $this->assertSame('app:', $built['prefix']);
+            $this->assertSame(1, $built['serializer']);
+        }
+
+        $this->assertSame(
+            [['auth', ['ops', 'secret']], ['select', 2], ['client', 'SETNAME', 'worker'], ['info', 'replication']],
+            $this->clients[0]->calls,
+            'AUTH, SELECT and SETNAME in that order, then the role check of a rediscovery',
+        );
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, list<list<mixed>>}>
+     */
+    public static function setupCommands(): array
+    {
+        return [
+            'empty password' => [['password' => ''], []],
+            'password "0"' => [['password' => '0'], []],
+            'password alone' => [['password' => 'secret'], [['auth', 'secret']]],
+            'username and password' => [['username' => 'ops', 'password' => 'secret'], [['auth', ['ops', 'secret']]]],
+            'empty username' => [['username' => '', 'password' => 'secret'], [['auth', 'secret']]],
+            // phpredis turns a scalar into a string itself, so '1234' sends the bytes Laravel's 1234 sends.
+            'int password with a username' => [['username' => 'ops', 'password' => 1234], [['auth', '1234']]],
+            'array password' => [['password' => ['ops', 'secret']], [['auth', ['ops', 'secret']]]],
+            'database 0' => [['database' => 0], [['select', 0]]],
+            'database as a string' => [['database' => '3'], [['select', 3]]],
+            'no database' => [[], []],
+            'empty name' => [['name' => ''], []],
+            'name' => [['name' => 'worker'], [['client', 'SETNAME', 'worker']]],
+        ];
+    }
+
+    /**
+     * Laravel 13.33's rules, from PhpRedisConnector::createClient().
+     *
+     * @param  array<string, mixed>  $settings
+     * @param  list<list<mixed>>  $calls
+     */
+    #[DataProvider('setupCommands')]
+    public function test_setup_commands_follow_laravels_rules(array $settings, array $calls): void
+    {
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', $settings), []);
+
+        $this->assertSame($calls, $this->clients[0]->calls);
     }
 
     public function test_connection_options_override_the_global_ones_and_prefix_joins_them(): void
@@ -303,14 +404,14 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             $this->config('s1:26379', [
                 'prefix' => 'app:', 'retry_deadline' => 0, 'options' => ['serializer' => 1, 'read_timeout' => 3.0],
             ]),
-            ['read_timeout' => 1.5, 'serializer' => 2, 'name' => 'worker', 'prefix' => 'global:'],
+            ['read_timeout' => 1.5, 'serializer' => 2, 'scan' => 1, 'prefix' => 'global:'],
         );
 
         $client = $this->clientConfigs[0];
 
         $this->assertSame(1, $client['serializer']);
         $this->assertSame(3.0, $client['read_timeout'], 'the connection options override the global ones');
-        $this->assertSame('worker', $client['name'], 'a global option nothing overrides still reaches the client');
+        $this->assertSame(1, $client['scan'], 'a global option nothing overrides still reaches the client');
         $this->assertSame('app:', $client['prefix'], "the connection's prefix beats Laravel's default global one");
         $this->assertArrayNotHasKey('options', $client, 'the options are merged in, not passed nested');
     }
