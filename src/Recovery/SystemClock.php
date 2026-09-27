@@ -11,11 +11,13 @@ namespace Tgi\LaravelPhpRedisSentinel\Recovery;
  */
 final class SystemClock implements MonotonicClock
 {
+    #[\Override]
     public function now(): int
     {
         return (int) hrtime(true);
     }
 
+    #[\Override]
     public function sleep(int $milliseconds): void
     {
         usleep($milliseconds * 1000);

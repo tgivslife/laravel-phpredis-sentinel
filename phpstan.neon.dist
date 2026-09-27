@@ -6,3 +6,4 @@ parameters:
     paths:
         - src
     tmpDir: build/phpstan
+    checkMissingOverrideMethodAttribute: true

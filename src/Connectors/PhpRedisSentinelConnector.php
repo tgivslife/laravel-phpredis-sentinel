@@ -121,6 +121,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @throws RedisException When the master refuses setup for a reason that is not a failover, such as a wrong password.
      * @throws RuntimeException When phpredis is missing or older than the package supports.
      */
+    #[\Override]
     public function connect(array $config, array $options): PhpRedisSentinelConnection
     {
         PhpRedisVersion::refuseOlder(phpversion('redis'));
@@ -294,6 +295,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      *
      * @throws SentinelConfigurationException Always.
      */
+    #[\Override]
     public function connectToCluster(array $config, array $clusterOptions, array $options): never
     {
         throw new SentinelConfigurationException(

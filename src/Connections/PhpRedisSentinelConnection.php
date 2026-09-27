@@ -102,6 +102,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * @param  string  $method
      * @param  array<array-key, mixed>  $parameters
      */
+    #[\Override]
     public function command($method, array $parameters = [])
     {
         $timeout = $this->blockingTimeout($method, $parameters);
@@ -124,6 +125,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<string, mixed>  $options
      */
+    #[\Override]
     public function scan($cursor, $options = [])
     {
         return $this->retryScan($cursor, fn ($cursor) => parent::scan($cursor, $options));
@@ -134,6 +136,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<string, mixed>  $options
      */
+    #[\Override]
     public function zscan($key, $cursor, $options = [])
     {
         return $this->retryScan($cursor, fn ($cursor) => parent::zscan($key, $cursor, $options));
@@ -144,6 +147,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<string, mixed>  $options
      */
+    #[\Override]
     public function hscan($key, $cursor, $options = [])
     {
         return $this->retryScan($cursor, fn ($cursor) => parent::hscan($key, $cursor, $options));
@@ -154,6 +158,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<string, mixed>  $options
      */
+    #[\Override]
     public function sscan($key, $cursor, $options = [])
     {
         return $this->retryScan($cursor, fn ($cursor) => parent::sscan($key, $cursor, $options));
@@ -166,6 +171,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @return Redis|array<array-key, mixed>
      */
+    #[\Override]
     public function pipeline(?callable $callback = null)
     {
         return $this->retryOnFailure(fn () => parent::pipeline($callback));
@@ -176,6 +182,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @return Redis|array<array-key, mixed>
      */
+    #[\Override]
     public function transaction(?callable $callback = null)
     {
         return $this->retryOnFailure(fn () => parent::transaction($callback));
@@ -186,6 +193,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<array-key, string>|string  $channels
      */
+    #[\Override]
     public function subscribe($channels, Closure $callback)
     {
         $this->retryOnFailure(
@@ -201,6 +209,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * @param  array<array-key, string>|string  $channels
      */
+    #[\Override]
     public function psubscribe($channels, Closure $callback)
     {
         $this->retryOnFailure(
@@ -219,6 +228,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * the dropped client. Here the replacement gets them turned off too, and the restore goes to the current client.
      * A nested call finds them off already and leaves them to the outer one.
      */
+    #[\Override]
     public function withoutSerializationOrCompression(callable $callback)
     {
         $unpacked = array_filter([
@@ -250,6 +260,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * Runs the callback once. Laravel retries opening a pipeline or transaction on a client rebuilt from the cached
      * address; inside retryOnFailure() that would nest a second loop that never rediscovers the master.
      */
+    #[\Override]
     protected function retryOnceOnLostConnection(Closure $callback)
     {
         return $callback();
@@ -260,6 +271,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * Does nothing: Laravel rebuilds from the cached address; here only refreshClient() replaces the client.
      */
+    #[\Override]
     protected function rebuildClient()
     {
         //

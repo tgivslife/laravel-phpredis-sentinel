@@ -40,6 +40,7 @@ final class PhpRedisTopologyConnector implements Connector
      * @throws SentinelConfigurationException When a connection without `sentinel_hosts` carries a Sentinel setting,
      *                                        or its options or the global ones do.
      */
+    #[\Override]
     public function connect(array $config, array $options): Connection
     {
         if (array_key_exists('sentinel_hosts', $config)) {
@@ -76,6 +77,7 @@ final class PhpRedisTopologyConnector implements Connector
      *
      * @throws SentinelConfigurationException When a Sentinel setting is set anywhere in the configuration.
      */
+    #[\Override]
     public function connectToCluster(array $config, array $clusterOptions, array $options): Connection
     {
         foreach ([...array_filter($config, is_array(...)), $clusterOptions] as $settings) {

@@ -27,6 +27,7 @@ final class RedisSentinelServiceProvider extends ServiceProvider
     /**
      * Register the package services.
      */
+    #[\Override]
     public function register(): void
     {
         // An extender, not a resolving callback: it runs before the manager is cached, so a refusal holds on every resolution;
