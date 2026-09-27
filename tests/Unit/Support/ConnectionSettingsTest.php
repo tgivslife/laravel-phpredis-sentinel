@@ -21,6 +21,7 @@ final class ConnectionSettingsTest extends TestCase
         $this->assertSame('mymaster', ConnectionSettings::string([], 'sentinel_service', 'mymaster'));
         $this->assertSame(3, ConnectionSettings::int(['retry_attempts' => null], 'retry_attempts', 3));
         $this->assertSame(2.0, ConnectionSettings::float([], 'timeout', 2.0));
+        $this->assertSame(2.0, ConnectionSettings::dataNodeTimeout(['read_timeout' => null], 'read_timeout'));
         $this->assertSame('', ConnectionSettings::hostList([]));
     }
 

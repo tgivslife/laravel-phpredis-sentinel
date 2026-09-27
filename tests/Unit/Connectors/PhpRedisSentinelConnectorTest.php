@@ -12,6 +12,7 @@ use Redis;
 use RedisException;
 use RedisSentinel;
 use ReflectionProperty;
+use stdClass;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
@@ -273,8 +274,6 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             'hosts entry' => [['sentinel_hosts' => [['s1']]], 'sentinel_hosts entries must be strings, array given.'],
             'service' => [['sentinel_service' => []], 'sentinel_service must be a string, array given.'],
             'sentinel_timeout' => [['sentinel_timeout' => []], 'sentinel_timeout must be a number, array given.'],
-            'timeout' => [['timeout' => []], 'timeout must be a number, array given.'],
-            'read_timeout' => [['read_timeout' => []], 'read_timeout must be a number, array given.'],
             'database' => [['database' => []], 'database must be a number, array given.'],
             'password entry' => [['password' => [['ops']]], 'password must be a string, array given.'],
             'username' => [['username' => ['ops'], 'password' => 'secret'], 'username must be a string, array given.'],
@@ -841,25 +840,95 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertSame([0.5, 0.5, 0.5], $this->clients[0]->readTimeouts, 'AUTH, SELECT, then the restore');
     }
 
-    public function test_an_unset_read_timeout_comes_back_as_the_default_socket_timeout(): void
+    public function test_unset_timeouts_default_to_two_seconds_without_a_deadline(): void
     {
-        // A client connected without one reads under default_socket_timeout; 0 set on a live socket fails every read.
+        // Nothing else bounds the wait: a node that accepts the connection but never answers would hold the process.
         $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
-            ->connect($this->config('s1:26379', ['password' => 'secret']), []);
+            ->connect($this->config('s1:26379', ['retry_deadline' => 0, 'read_timeout' => null]), []);
 
-        $this->assertSame([5.0, (float) ini_get('default_socket_timeout')], $this->clients[0]->readTimeouts, 'AUTH, then the restore');
+        $this->assertSame([2.0, 2.0], [$this->clientConfigs[0]['timeout'], $this->clientConfigs[0]['read_timeout']]);
     }
 
-    public function test_an_unset_read_timeout_is_cut_to_the_deadline_from_what_the_socket_waits(): void
+    public function test_an_unset_read_timeout_comes_back_as_two_seconds_after_a_rediscovery(): void
     {
-        // A deadline longer than default_socket_timeout must not lengthen the connect's or a stage's read.
-        $default = (float) ini_get('default_socket_timeout');
+        // A deadline far longer than the default must not lengthen the connect or the role check.
+        $config = $this->config('s1:26379', ['retry_deadline' => 100_000]);
 
+        // A connection before the failover caches 10.0.0.7, which then dies: the next connect rediscovers.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.7', '6380']])->connect($config, []);
+        $this->forgetRecordings();
+
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']], deadMasters: ['10.0.0.7'])
+            ->connect($config, []);
+
+        $this->assertSame([2.0, 2.0], [$this->clientConfigs[1]['timeout'], $this->clientConfigs[1]['read_timeout']]);
+        $this->assertSame([2.0, 2.0], $this->clients[0]->readTimeouts, 'the role check, then the restore');
+    }
+
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('timeoutPlacements')]
+    public function test_a_timeout_set_wherever_laravel_reads_it_replaces_the_default(array $settings, array $options): void
+    {
         $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
-            ->connect($this->config('s1:26379', ['password' => 'secret', 'retry_deadline' => 100_000]), []);
+            ->connect($this->config('s1:26379', ['retry_deadline' => 0] + $settings), $options);
 
-        $this->assertSame($default, $this->clientConfigs[0]['read_timeout'], 'the client is connected under it');
-        $this->assertSame([$default, $default], $this->clients[0]->readTimeouts, 'AUTH, then the restore');
+        $this->assertSame(1.5, $this->clientConfigs[0]['timeout']);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>}>
+     */
+    public static function timeoutPlacements(): array
+    {
+        return [
+            'connection' => [['timeout' => 1.5], []],
+            'connection options' => [['options' => ['timeout' => 1.5]], []],
+            'global options' => [[], ['timeout' => 1.5]],
+            'numeric string, as env() returns it' => [['timeout' => '1.5'], []],
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('unusableTimeouts')]
+    public function test_an_unusable_timeout_is_refused_before_anything_is_contacted(array $settings, array $options, string $message): void
+    {
+        // Without a deadline the connector reads no timeout itself: the check must not depend on one.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+                ->connect($this->config('s1:26379', ['retry_deadline' => 0] + $settings), $options);
+
+            $this->fail('Expected the timeout to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame($message, $exception->getMessage());
+            $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame([], $this->clientHosts, 'no client is built');
+        }
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>, string}>
+     */
+    public static function unusableTimeouts(): array
+    {
+        return [
+            'zero' => [['timeout' => 0], [], 'timeout must be a positive number of seconds, 0 given.'],
+            'zero read timeout' => [['read_timeout' => 0.0], [], 'read_timeout must be a positive number of seconds, 0.0 given.'],
+            'negative, the usual phpredis setting for a subscriber' => [['read_timeout' => -1], [], 'read_timeout must be a positive number of seconds, -1 given; subscribe() and psubscribe() already wait without a limit.'],
+            'not a number' => [['timeout' => 'abc'], [], "timeout must be a positive number of seconds, 'abc' given."],
+            'empty, as a blank env()' => [['read_timeout' => ''], [], "read_timeout must be a positive number of seconds, '' given."],
+            'boolean' => [['timeout' => true], [], 'timeout must be a positive number of seconds, true given.'],
+            'infinite' => [['timeout' => '1e999'], [], "timeout must be a positive number of seconds, '1e999' given."],
+            'array' => [['timeout' => []], [], 'timeout must be a positive number of seconds, array given.'],
+            'object' => [['read_timeout' => new stdClass], [], 'read_timeout must be a positive number of seconds, stdClass given.'],
+            'in the connection options' => [['options' => ['read_timeout' => 0]], [], 'read_timeout must be a positive number of seconds, 0 given.'],
+            'in the global options' => [[], ['timeout' => -0.5], 'timeout must be a positive number of seconds, -0.5 given.'],
+        ];
     }
 
     public function test_each_setup_stage_waits_at_most_what_the_stages_before_it_left(): void

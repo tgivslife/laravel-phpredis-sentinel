@@ -20,7 +20,6 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
 use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
-use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
 use Throwable;
 
 /**
@@ -140,8 +139,13 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         $hosts = $this->sentinelClients->parseHosts(ConnectionSettings::hostList($config));
         $cacheKey = self::masterCacheKey($service, $hosts, $config);
 
+        // Read once, from the merge the client is built from, so a bad value fails here and not at a failover.
+        $merged = array_merge($config, $options, $formattedOptions);
+        $timeout = ConnectionSettings::dataNodeTimeout($merged, 'timeout');
+        $readTimeout = ConnectionSettings::dataNodeTimeout($merged, 'read_timeout');
+
         $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use (
-            $config, $options, $formattedOptions, $service, $hosts, $cacheKey,
+            $config, $options, $formattedOptions, $service, $hosts, $cacheKey, $timeout, $readTimeout,
         ): Redis {
             [$host, $port] = $this->resolveMaster($config, $service, $hosts, $cacheKey, $refresh, $deadline);
 
@@ -154,24 +158,26 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             // Overrides any configured value: Laravel's stock config sets 3, which cannot be told from a chosen 3.
             $clientConfig['max_retries'] = 0;
 
+            $clientConfig['timeout'] = $timeout;
+            $clientConfig['read_timeout'] = $readTimeout;
+
             try {
-                // Setup runs under timeouts cut to the deadline; the configured read timeout, or
-                // default_socket_timeout when unset, returns for later commands.
+                // Setup runs under timeouts cut to the deadline; the configured read timeout returns afterward.
                 $client = ($this->clients)(
-                    $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $deadline),
+                    $this->clampClientTimeouts(array_diff_key($clientConfig, self::SETUP_COMMAND_KEYS), $timeout, $readTimeout, $deadline),
                 );
 
                 try {
-                    $this->sendSetupCommands($client, $clientConfig, $deadline, "{$host}:{$port}");
+                    $this->sendSetupCommands($client, $clientConfig, $readTimeout, $deadline, "{$host}:{$port}");
 
                     if ($refresh) {
-                        $this->stage($client, $clientConfig, $deadline, "the role check of [{$host}:{$port}]", function () use ($client, $host, $port): void {
+                        $this->stage($client, $readTimeout, $deadline, "the role check of [{$host}:{$port}]", function () use ($client, $host, $port): void {
                             $this->assertMaster($client, $host, $port);
                         });
                     }
                 } finally {
                     if ($deadline !== null) {
-                        $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(ConnectionSettings::float($clientConfig, 'read_timeout', 0.0)));
+                        $client->setOption(Redis::OPT_READ_TIMEOUT, $readTimeout);
                     }
                 }
             } catch (Throwable $exception) {
@@ -242,16 +248,17 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * which changes nothing: their arguments are never serialized, compressed or prefixed.
      *
      * @param  array<array-key, mixed>  $config
+     * @param  float  $readTimeout  The configured read timeout, which each stage's read is cut from.
      *
      * @throws SentinelDiscoveryException Retryable: the deadline was spent before a stage started.
      * @throws SentinelConfigurationException When a credential or the database is not a scalar.
      */
-    private function sendSetupCommands(Redis $client, array $config, ?RecoveryDeadline $deadline, string $node): void
+    private function sendSetupCommands(Redis $client, array $config, float $readTimeout, ?RecoveryDeadline $deadline, string $node): void
     {
         if (! empty($config['password'])) {
             $credentials = self::credentials($config);
 
-            $this->stage($client, $config, $deadline, "AUTH on [{$node}]", static function () use ($client, $credentials): void {
+            $this->stage($client, $readTimeout, $deadline, "AUTH on [{$node}]", static function () use ($client, $credentials): void {
                 $client->auth($credentials);
             });
         }
@@ -259,7 +266,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         if (isset($config['database'])) {
             $database = ConnectionSettings::int($config, 'database', 0);
 
-            $this->stage($client, $config, $deadline, "SELECT on [{$node}]", static function () use ($client, $database): void {
+            $this->stage($client, $readTimeout, $deadline, "SELECT on [{$node}]", static function () use ($client, $database): void {
                 $client->select($database);
             });
         }
@@ -267,7 +274,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         if (! empty($config['name'])) {
             $name = $config['name'];
 
-            $this->stage($client, $config, $deadline, "CLIENT SETNAME on [{$node}]", static function () use ($client, $name): void {
+            $this->stage($client, $readTimeout, $deadline, "CLIENT SETNAME on [{$node}]", static function () use ($client, $name): void {
                 $client->client('SETNAME', $name);
             });
         }
@@ -276,12 +283,12 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     /**
      * One setup round trip: refused once the deadline is spent, otherwise its read waits at most what is left.
      *
-     * @param  array<array-key, mixed>  $config
+     * @param  float  $readTimeout  The configured read timeout, cut to what the deadline has left.
      * @param  Closure(): void  $run
      *
      * @throws SentinelDiscoveryException Retryable, so the retry policy decides; on a spent budget it gives up.
      */
-    private function stage(Redis $client, array $config, ?RecoveryDeadline $deadline, string $name, Closure $run): void
+    private function stage(Redis $client, float $readTimeout, ?RecoveryDeadline $deadline, string $name, Closure $run): void
     {
         if ($deadline !== null) {
             if ($deadline->spent()) {
@@ -291,7 +298,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 );
             }
 
-            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(ReadTimeout::effective(ConnectionSettings::float($config, 'read_timeout', 0.0))));
+            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp($readTimeout));
         }
 
         $run();
@@ -496,11 +503,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  array<array-key, mixed>  $config
      * @return array<array-key, mixed>
      */
-    private function clampClientTimeouts(array $config, ?RecoveryDeadline $deadline): array
+    private function clampClientTimeouts(array $config, float $timeout, float $readTimeout, ?RecoveryDeadline $deadline): array
     {
         if ($deadline !== null) {
-            $config['timeout'] = $deadline->clamp(ConnectionSettings::float($config, 'timeout', 0.0));
-            $config['read_timeout'] = $deadline->clamp(ReadTimeout::effective(ConnectionSettings::float($config, 'read_timeout', 0.0)));
+            $config['timeout'] = $deadline->clamp($timeout);
+            $config['read_timeout'] = $deadline->clamp($readTimeout);
         }
 
         return $config;

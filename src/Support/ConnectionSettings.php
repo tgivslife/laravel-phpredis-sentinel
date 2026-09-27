@@ -9,7 +9,7 @@ use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 /**
  * Reads a Sentinel connection's settings: the one place their types and defaults are checked.
  *
- * A scalar is cast as PHP casts it; anything else is refused, naming the setting.
+ * A scalar is cast as PHP casts it, unless the reader states a stricter rule; anything else is refused, naming the setting.
  *
  * @internal
  */
@@ -21,6 +21,11 @@ final class ConnectionSettings
     private const float DEFAULT_SENTINEL_TIMEOUT = 0.5;
 
     /**
+     * The data node's connect and read timeouts, in seconds, when they are not set.
+     */
+    private const float DEFAULT_DATA_NODE_TIMEOUT = 2.0;
+
+    /**
      * The `sentinel_timeout` setting, or its default.
      *
      * @param  array<array-key, mixed>  $config
@@ -30,6 +35,36 @@ final class ConnectionSettings
     public static function sentinelTimeout(array $config): float
     {
         return self::float($config, 'sentinel_timeout', self::DEFAULT_SENTINEL_TIMEOUT);
+    }
+
+    /**
+     * A data-node timeout, `timeout` or `read_timeout`, or its 2.0 s default when it is not set.
+     *
+     * Only a positive number is accepted: phpredis gives 0 and negative values meanings of its own,
+     * `default_socket_timeout` or no limit, and without a recovery deadline nothing else would bound the wait.
+     *
+     * @param  array<array-key, mixed>  $config  The configuration the client is built from.
+     *
+     * @throws SentinelConfigurationException When the setting is not a positive number.
+     */
+    public static function dataNodeTimeout(array $config, string $key): float
+    {
+        $value = $config[$key] ?? self::DEFAULT_DATA_NODE_TIMEOUT;
+        $seconds = is_numeric($value) ? (float) $value : null;
+
+        if ($seconds === null || ! is_finite($seconds) || $seconds <= 0) {
+            // -1 is the usual phpredis setting for a subscriber; subscriptions here lift the read timeout themselves.
+            throw new SentinelConfigurationException(sprintf(
+                '%s must be a positive number of seconds, %s given%s',
+                $key,
+                is_scalar($value) ? var_export($value, true) : get_debug_type($value),
+                $key === 'read_timeout' && $seconds !== null && $seconds < 0
+                    ? '; subscribe() and psubscribe() already wait without a limit.'
+                    : '.',
+            ));
+        }
+
+        return $seconds;
     }
 
     /**
