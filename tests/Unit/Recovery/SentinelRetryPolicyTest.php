@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Recovery;
 
 use ErrorException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RedisException;
 use RuntimeException;
@@ -477,11 +478,57 @@ final class SentinelRetryPolicyTest extends TestCase
         );
     }
 
-    public function test_a_retry_setting_that_is_not_a_scalar_is_refused(): void
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    #[DataProvider('unusableRetrySettings')]
+    public function test_a_retry_setting_that_is_not_a_whole_number_of_0_or_more_is_refused(array $config, string $message): void
     {
-        $this->expectExceptionObject(new SentinelConfigurationException('retry_attempts must be a number, array given.'));
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
 
-        SentinelRetryPolicy::fromConfig(['retry_attempts' => [3]], $this->logger);
+        SentinelRetryPolicy::fromConfig($config, $this->logger);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, string}>
+     */
+    public static function unusableRetrySettings(): array
+    {
+        return [
+            'not a scalar' => [['retry_attempts' => [3]], 'retry_attempts must be a whole number, 0 or more, array given.'],
+            'negative, which used to become 0' => [['retry_attempts' => -1], 'retry_attempts must be a whole number, 0 or more, -1 given.'],
+            'seconds where milliseconds are meant' => [['retry_delay' => 0.5], 'retry_delay must be a whole number of milliseconds, 0 or more, 0.5 given.'],
+            'a fraction as a string' => [['retry_deadline' => '1.5'], "retry_deadline must be a whole number of milliseconds, 0 or more, '1.5' given."],
+            'not a number' => [['retry_delay' => 'abc'], "retry_delay must be a whole number of milliseconds, 0 or more, 'abc' given."],
+            'empty, as a blank env()' => [['retry_deadline' => ''], "retry_deadline must be a whole number of milliseconds, 0 or more, '' given."],
+            'boolean' => [['retry_attempts' => true], 'retry_attempts must be a whole number, 0 or more, true given.'],
+        ];
+    }
+
+    public function test_retry_settings_read_from_env_strings_keep_their_values(): void
+    {
+        $policy = SentinelRetryPolicy::fromConfig(
+            ['retry_attempts' => '0', 'retry_delay' => '250', 'retry_deadline' => '0'],
+            $this->logger,
+            $this->clock,
+        );
+        $calls = 0;
+
+        try {
+            $policy->run(
+                function () use (&$calls): never {
+                    $calls++;
+
+                    throw new RedisException('Connection refused');
+                },
+                static fn () => null,
+                'test',
+            );
+
+            $this->fail('Expected no retry.');
+        } catch (SentinelFailoverException) {
+            $this->assertSame(1, $calls, "retry_attempts '0' is no retry, not the default 3");
+        }
     }
 
     public function test_a_configuration_error_is_not_retried_whatever_its_message(): void

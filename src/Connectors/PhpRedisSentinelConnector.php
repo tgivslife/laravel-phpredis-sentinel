@@ -137,6 +137,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
         $service = ConnectionSettings::string($config, 'sentinel_service', 'mymaster');
         $hosts = $this->sentinelClients->parseHosts(ConnectionSettings::hostList($config));
+        $sentinelTimeout = ConnectionSettings::sentinelTimeout($config);
         $cacheKey = self::masterCacheKey($service, $hosts, $config);
 
         // Read once, from the merge the client is built from, so a bad value fails here and not at a failover.
@@ -145,9 +146,9 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         $readTimeout = ConnectionSettings::dataNodeTimeout($merged, 'read_timeout');
 
         $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use (
-            $config, $options, $formattedOptions, $service, $hosts, $cacheKey, $timeout, $readTimeout,
+            $config, $options, $formattedOptions, $service, $hosts, $sentinelTimeout, $cacheKey, $timeout, $readTimeout,
         ): Redis {
-            [$host, $port] = $this->resolveMaster($config, $service, $hosts, $cacheKey, $refresh, $deadline);
+            [$host, $port] = $this->resolveMaster($config, $service, $hosts, $sentinelTimeout, $cacheKey, $refresh, $deadline);
 
             $clientConfig = array_merge(
                 self::withoutDiscoveryKeys($config), ['host' => $host, 'port' => $port], $options, $formattedOptions,
@@ -372,6 +373,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      *
      * @param  array<string, mixed>  $config
      * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
+     * @param  float  $sentinelTimeout  Each probe's connect and read timeout, as configured.
      * @return array{0: string, 1: int}
      *
      * @throws SentinelDiscoveryException When no sentinel names a usable master.
@@ -381,6 +383,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         array $config,
         string $service,
         array $hosts,
+        float $sentinelTimeout,
         string $cacheKey,
         bool $refresh,
         ?RecoveryDeadline $deadline,
@@ -404,7 +407,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             }
 
             try {
-                $address = ($this->sentinels)($host, $port, $this->clampSentinelTimeout($config, $deadline))
+                $address = ($this->sentinels)($host, $port, $this->clampSentinelTimeout($config, $sentinelTimeout, $deadline))
                     ->getMasterAddrByName($service);
             } catch (RedisException $exception) {
                 $failures[] = "{$host}:{$port} ({$exception->getMessage()})";
@@ -448,12 +451,12 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
      * @param  array<string, mixed>  $config
      *
-     * @throws SentinelConfigurationException When a credential is not a scalar.
+     * @throws SentinelConfigurationException When a credential is not a scalar, or the username holds whitespace.
      */
     private static function masterCacheKey(string $service, array $hosts, array $config): string
     {
         $credentials = hash('sha256', serialize([
-            ConnectionSettings::string($config, 'sentinel_username', ''),
+            ConnectionSettings::sentinelUsername($config),
             ConnectionSettings::string($config, 'sentinel_password', ''),
         ]));
 
@@ -483,16 +486,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     }
 
     /**
-     * The sentinel probe timeout cut to what the deadline has left.
+     * The configuration a sentinel client is built from, its probe timeout cut to what the deadline has left.
      *
      * @param  array<string, mixed>  $config
      * @return array<string, mixed>
      */
-    private function clampSentinelTimeout(array $config, ?RecoveryDeadline $deadline): array
+    private function clampSentinelTimeout(array $config, float $sentinelTimeout, ?RecoveryDeadline $deadline): array
     {
-        if ($deadline !== null) {
-            $config['sentinel_timeout'] = $deadline->clamp(ConnectionSettings::sentinelTimeout($config));
-        }
+        $config['sentinel_timeout'] = $deadline?->clamp($sentinelTimeout) ?? $sentinelTimeout;
 
         return $config;
     }

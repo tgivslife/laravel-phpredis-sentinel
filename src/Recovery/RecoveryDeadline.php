@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Recovery;
 
+use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
 use ValueError;
 
 /**
@@ -19,7 +20,7 @@ use ValueError;
 final readonly class RecoveryDeadline
 {
     /**
-     * The shortest socket timeout ever handed out, in seconds: phpredis reads zero as "wait forever".
+     * The shortest socket timeout ever handed out, in seconds: phpredis never reads zero as a short wait.
      */
     private const float MINIMUM_TIMEOUT_SECONDS = 0.001;
 
@@ -58,7 +59,7 @@ final readonly class RecoveryDeadline
      * Milliseconds left, never negative.
      *
      * Rounded down, so it reaches 0 up to a millisecond before the deadline passes: use spent() to test expiry,
-     * and never hand this to phpredis, which reads 0 as no limit (clamp() is for socket timeouts).
+     * and never hand this to phpredis, which gives 0 meanings of its own (clamp() is for socket timeouts).
      */
     public function remainingMs(): int
     {
@@ -73,8 +74,10 @@ final readonly class RecoveryDeadline
     /**
      * A socket timeout cut down to what is left, in seconds.
      *
-     * A configured value of zero or less means unbounded and becomes the remainder outright.
-     * Never zero on the way out, since that would mean unbounded again: a spent deadline yields the minimum,
+     * A negative value, phpredis's no limit, becomes the remainder outright. Callers do not pass 0, which phpredis
+     * gives meanings of its own (`default_socket_timeout` when connecting, failing at once on a live socket): the
+     * configured timeouts are positive, and a client's own read timeout goes through {@see ReadTimeout::effective()}.
+     * Never zero on the way out, for the same reason: a spent deadline yields the minimum,
      * and callers that must not start work on a spent deadline check spent() first.
      */
     public function clamp(float $configuredSeconds): float

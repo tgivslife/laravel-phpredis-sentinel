@@ -98,7 +98,62 @@ final class SentinelClientFactoryTest extends TestCase
         return [
             'password' => [['sentinel_password' => ['secret']], 'sentinel_password must be a string, array given.'],
             'username' => [['sentinel_username' => ['ops'], 'sentinel_password' => 'secret'], 'sentinel_username must be a string, array given.'],
-            'timeout' => [['sentinel_timeout' => [1]], 'sentinel_timeout must be a number, array given.'],
+            'timeout' => [['sentinel_timeout' => [1]], 'sentinel_timeout must be a positive number of seconds, array given.'],
+        ];
+    }
+
+    public function test_the_password_is_sent_as_written(): void
+    {
+        // Spaces around a Redis password are part of it: ' pw ' authenticates where 'pw' does not.
+        $this->assertSame(' pw ', $this->factory->options('s1', 26379, ['sentinel_password' => ' pw '])['auth'] ?? null);
+        $this->assertSame(
+            ['ops', ' '],
+            $this->factory->options('s1', 26379, ['sentinel_username' => 'ops', 'sentinel_password' => ' '])['auth'] ?? null,
+            'a password of spaces counts as set',
+        );
+    }
+
+    #[DataProvider('usernamesWithWhitespace')]
+    public function test_a_username_with_whitespace_is_refused(string $username, string $message): void
+    {
+        // Redis refuses such a username in ACL SETUSER, so it could never authenticate.
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
+
+        $this->factory->options('s1', 26379, ['sentinel_username' => $username, 'sentinel_password' => 'secret']);
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function usernamesWithWhitespace(): array
+    {
+        return [
+            'trailing space, as from an env file' => ['ops ', "sentinel_username must not contain whitespace, which no Redis username can, 'ops ' given."],
+            'leading space' => [' ops', "sentinel_username must not contain whitespace, which no Redis username can, ' ops' given."],
+            'inner space' => ['o ps', "sentinel_username must not contain whitespace, which no Redis username can, 'o ps' given."],
+            'tab' => ["ops\t", "sentinel_username must not contain whitespace, which no Redis username can, 'ops\t' given."],
+        ];
+    }
+
+    #[DataProvider('unusableSentinelTimeouts')]
+    public function test_a_sentinel_timeout_that_is_not_a_positive_number_is_refused(mixed $timeout, string $message): void
+    {
+        // phpredis reads 0 as default_socket_timeout, so a sentinel that never answers would stall discovery 60 s.
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
+
+        $this->factory->options('s1', 26379, ['sentinel_timeout' => $timeout]);
+    }
+
+    /**
+     * @return array<string, array{mixed, string}>
+     */
+    public static function unusableSentinelTimeouts(): array
+    {
+        return [
+            'zero' => [0, 'sentinel_timeout must be a positive number of seconds, 0 given.'],
+            'negative' => [-0.5, 'sentinel_timeout must be a positive number of seconds, -0.5 given.'],
+            'not a number' => ['abc', "sentinel_timeout must be a positive number of seconds, 'abc' given."],
+            'empty, as a blank env()' => ['', "sentinel_timeout must be a positive number of seconds, '' given."],
         ];
     }
 }

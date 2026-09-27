@@ -273,14 +273,40 @@ final class PhpRedisSentinelConnectorTest extends TestCase
             'hosts type' => [['sentinel_hosts' => 5], 'sentinel_hosts must be a string or a list, int given.'],
             'hosts entry' => [['sentinel_hosts' => [['s1']]], 'sentinel_hosts entries must be strings, array given.'],
             'service' => [['sentinel_service' => []], 'sentinel_service must be a string, array given.'],
-            'sentinel_timeout' => [['sentinel_timeout' => []], 'sentinel_timeout must be a number, array given.'],
+            'sentinel_timeout' => [['sentinel_timeout' => []], 'sentinel_timeout must be a positive number of seconds, array given.'],
+            'retry_delay in seconds' => [['retry_delay' => 0.5], 'retry_delay must be a whole number of milliseconds, 0 or more, 0.5 given.'],
             'database' => [['database' => []], 'database must be a number, array given.'],
             'password entry' => [['password' => [['ops']]], 'password must be a string, array given.'],
             'username' => [['username' => ['ops'], 'password' => 'secret'], 'username must be a string, array given.'],
             // Read for the master cache key before any sentinel is asked, so refused before it is serialized.
             'sentinel_password' => [['sentinel_password' => new class {}], 'sentinel_password must be a string, class@anonymous given.'],
             'sentinel_username' => [['sentinel_username' => ['ops']], 'sentinel_username must be a string, array given.'],
+            // Also read for the cache key: the sentinel stand-in replaces the factory, so only that read refuses it.
+            'sentinel_username with a space' => [
+                ['sentinel_username' => 'ops ', 'sentinel_password' => 'secret'],
+                "sentinel_username must not contain whitespace, which no Redis username can, 'ops ' given.",
+            ],
         ];
+    }
+
+    public function test_a_sentinel_timeout_is_refused_at_connect_even_when_the_master_is_cached(): void
+    {
+        // It is not part of the cache key, and a cache hit asks no sentinel: checked only in a probe, this connection
+        // would open, and its error would first appear at a failover, as a failed rediscovery.
+        $config = $this->config('s1:26379');
+        $connector = $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']]);
+
+        $connector->connect($config, []);
+
+        try {
+            $connector->connect(['sentinel_timeout' => 0] + $config, []);
+
+            $this->fail('Expected the sentinel timeout to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame('sentinel_timeout must be a positive number of seconds, 0 given.', $exception->getMessage());
+            $this->assertSame(1, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame(['10.0.0.9:6380'], $this->clientHosts, 'no client is built');
+        }
     }
 
     /**

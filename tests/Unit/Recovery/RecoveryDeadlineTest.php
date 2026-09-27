@@ -17,7 +17,7 @@ final class RecoveryDeadlineTest extends TestCase
         $deadline = RecoveryDeadline::after($clock, $clock->now(), 50);
 
         $this->assertSame(0.05, $deadline->clamp(2.0));
-        $this->assertSame(0.05, $deadline->clamp(0.0), 'zero means unbounded in phpredis');
+        $this->assertSame(0.05, $deadline->clamp(-1.0), 'a negative timeout means no limit in phpredis');
         $this->assertSame(0.01, $deadline->clamp(0.01), 'a timeout already inside the budget is kept');
         $this->assertFalse($deadline->spent());
 
@@ -35,7 +35,7 @@ final class RecoveryDeadlineTest extends TestCase
 
         $this->assertTrue($deadline->spent());
         $this->assertSame(0, $deadline->remainingMs());
-        $this->assertSame(0.001, $deadline->clamp(2.0), 'zero would mean wait forever');
+        $this->assertSame(0.001, $deadline->clamp(2.0), 'phpredis never reads zero as a short wait');
     }
 
     public function test_an_extended_deadline_is_a_new_instant_later_by_the_extension(): void

@@ -98,15 +98,15 @@ final class SentinelRetryPolicy
      *
      * @param  array<string, mixed>  $config  The connection configuration, discovery keys included.
      *
-     * @throws SentinelConfigurationException When a retry setting is not a scalar.
+     * @throws SentinelConfigurationException When a retry setting is not a whole number of 0 or more.
      */
     public static function fromConfig(array $config, LoggerInterface $logger, MonotonicClock $clock = new SystemClock): self
     {
         return new self(
             $logger,
-            max(ConnectionSettings::int($config, 'retry_attempts', 3), 0),
-            max(ConnectionSettings::int($config, 'retry_delay', 500), 0),
-            max(ConnectionSettings::int($config, 'retry_deadline', 5000), 0),
+            ConnectionSettings::wholeNumber($config, 'retry_attempts', 3),
+            ConnectionSettings::wholeNumber($config, 'retry_delay', 500, 'milliseconds'),
+            ConnectionSettings::wholeNumber($config, 'retry_deadline', 5000, 'milliseconds'),
             clock: $clock,
         );
     }

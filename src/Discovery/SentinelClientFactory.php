@@ -60,12 +60,14 @@ final class SentinelClientFactory
      * password when only that is, no auth key otherwise.
      * A username without a password is refused rather than quietly downgraded - it authenticates nothing, and silently
      * talking to the sentinels anonymously is the kind of thing that only surfaces when an ACL finally starts being enforced.
+     * The password is sent as written: spaces around it are part of it, and one made only of spaces counts as set.
      *
      * @param  array<string, mixed>  $config
      * @return array{host: string, port: int, connectTimeout: float, readTimeout: float, auth?: string|array{0: string, 1: string}}
      *
-     * @throws SentinelConfigurationException When only one half of the sentinel credentials is configured, or a
-     *                                        sentinel setting is not a scalar.
+     * @throws SentinelConfigurationException When only one half of the sentinel credentials is configured, a
+     *                                        setting is not a scalar, the username holds whitespace, or the timeout
+     *                                        is not a positive number.
      */
     public function options(string $host, int $port, array $config): array
     {
@@ -78,8 +80,8 @@ final class SentinelClientFactory
             'readTimeout' => $timeout,
         ];
 
-        $username = trim(ConnectionSettings::string($config, 'sentinel_username', ''));
-        $password = trim(ConnectionSettings::string($config, 'sentinel_password', ''));
+        $username = ConnectionSettings::sentinelUsername($config);
+        $password = ConnectionSettings::string($config, 'sentinel_password', '');
 
         if ($username !== '' && $password === '') {
             throw new SentinelConfigurationException(

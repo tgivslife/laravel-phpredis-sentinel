@@ -10,6 +10,8 @@ use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
  * Reads a Sentinel connection's settings: the one place their types and defaults are checked.
  *
  * A scalar is cast as PHP casts it, unless the reader states a stricter rule; anything else is refused, naming the setting.
+ * Socket waits are seconds and may be fractional, as phpredis takes them; the recovery budget is whole milliseconds,
+ * as phpredis's `retry_interval` and Sentinel's own timing settings are.
  *
  * @internal
  */
@@ -26,15 +28,18 @@ final class ConnectionSettings
     private const float DEFAULT_DATA_NODE_TIMEOUT = 2.0;
 
     /**
-     * The `sentinel_timeout` setting, or its default.
+     * The `sentinel_timeout` setting, a sentinel probe's connect and read timeout, or its 0.5 s default when not set.
+     *
+     * Only a positive number is accepted: phpredis reads 0 as `default_socket_timeout`, 60 s by default, so a
+     * sentinel that accepts the connection and never answers would stall discovery that long.
      *
      * @param  array<array-key, mixed>  $config
      *
-     * @throws SentinelConfigurationException When the setting is not a scalar.
+     * @throws SentinelConfigurationException When the setting is not a positive number.
      */
     public static function sentinelTimeout(array $config): float
     {
-        return self::float($config, 'sentinel_timeout', self::DEFAULT_SENTINEL_TIMEOUT);
+        return self::positiveSeconds($config, 'sentinel_timeout', self::DEFAULT_SENTINEL_TIMEOUT);
     }
 
     /**
@@ -49,22 +54,58 @@ final class ConnectionSettings
      */
     public static function dataNodeTimeout(array $config, string $key): float
     {
-        $value = $config[$key] ?? self::DEFAULT_DATA_NODE_TIMEOUT;
-        $seconds = is_numeric($value) ? (float) $value : null;
+        return self::positiveSeconds($config, $key, self::DEFAULT_DATA_NODE_TIMEOUT);
+    }
 
-        if ($seconds === null || ! is_finite($seconds) || $seconds <= 0) {
-            // -1 is the usual phpredis setting for a subscriber; subscriptions here lift the read timeout themselves.
+    /**
+     * The `sentinel_username` setting, '' when it is not set.
+     *
+     * Redis refuses a username with whitespace or a null character (`ACL SETUSER`), so such a one can never
+     * authenticate; a stray space from an env file is refused here rather than failing every sentinel.
+     *
+     * @param  array<array-key, mixed>  $config
+     *
+     * @throws SentinelConfigurationException When the setting is not a scalar, or holds whitespace.
+     */
+    public static function sentinelUsername(array $config): string
+    {
+        $username = self::string($config, 'sentinel_username', '');
+
+        if (preg_match('/[\s\x00]/', $username) === 1) {
             throw new SentinelConfigurationException(sprintf(
-                '%s must be a positive number of seconds, %s given%s',
-                $key,
-                is_scalar($value) ? var_export($value, true) : get_debug_type($value),
-                $key === 'read_timeout' && $seconds !== null && $seconds < 0
-                    ? '; subscribe() and psubscribe() already wait without a limit.'
-                    : '.',
+                'sentinel_username must not contain whitespace, which no Redis username can, %s given.',
+                var_export($username, true),
             ));
         }
 
-        return $seconds;
+        return $username;
+    }
+
+    /**
+     * A count or a number of milliseconds, 0 or more, or the default when it is not set.
+     *
+     * A fraction is refused rather than cut: `retry_delay => 0.5`, meant as seconds, would otherwise be 0 ms.
+     *
+     * @param  array<array-key, mixed>  $config
+     * @param  string  $unit  What the number counts, for the message, such as `milliseconds`; '' for a plain count.
+     *
+     * @throws SentinelConfigurationException When the setting is not a whole number of 0 or more.
+     */
+    public static function wholeNumber(array $config, string $key, int $default, string $unit = ''): int
+    {
+        $value = $config[$key] ?? $default;
+        $number = is_int($value) ? $value : (is_float($value) || is_string($value) ? filter_var($value, FILTER_VALIDATE_INT) : false);
+
+        if ($number === false || $number < 0) {
+            throw new SentinelConfigurationException(sprintf(
+                '%s must be a whole number%s, 0 or more, %s given.',
+                $key,
+                $unit === '' ? '' : " of {$unit}",
+                is_scalar($value) ? var_export($value, true) : get_debug_type($value),
+            ));
+        }
+
+        return $number;
     }
 
     /**
@@ -148,20 +189,29 @@ final class ConnectionSettings
     }
 
     /**
-     * A number setting, or the default when it is not set.
+     * A timeout in seconds that must be positive and finite, or the default when it is not set.
      *
      * @param  array<array-key, mixed>  $config
      *
-     * @throws SentinelConfigurationException When the setting is not a scalar.
+     * @throws SentinelConfigurationException When the setting is not a positive number.
      */
-    public static function float(array $config, string $key, float $default): float
+    private static function positiveSeconds(array $config, string $key, float $default): float
     {
         $value = $config[$key] ?? $default;
+        $seconds = is_numeric($value) ? (float) $value : null;
 
-        if (! is_scalar($value)) {
-            throw new SentinelConfigurationException(sprintf('%s must be a number, %s given.', $key, get_debug_type($value)));
+        if ($seconds === null || ! is_finite($seconds) || $seconds <= 0) {
+            // -1 is the usual phpredis setting for a subscriber; subscriptions here lift the read timeout themselves.
+            throw new SentinelConfigurationException(sprintf(
+                '%s must be a positive number of seconds, %s given%s',
+                $key,
+                is_scalar($value) ? var_export($value, true) : get_debug_type($value),
+                $key === 'read_timeout' && $seconds !== null && $seconds < 0
+                    ? '; subscribe() and psubscribe() already wait without a limit.'
+                    : '.',
+            ));
         }
 
-        return (float) $value;
+        return $seconds;
     }
 }
