@@ -323,6 +323,83 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         ];
     }
 
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('sentinelKeysInOptions')]
+    public function test_a_sentinel_key_in_options_is_refused_before_anything_is_contacted(array $settings, array $options, string $message): void
+    {
+        // The Sentinel settings are read from the connection itself: one in the options would be ignored.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+                ->connect($this->config('s1:26379', $settings), $options);
+
+            $this->fail('Expected the Sentinel setting in the options to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame($message, $exception->getMessage());
+            $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame([], $this->clientHosts, 'no client is built');
+        }
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>, string}>
+     */
+    public static function sentinelKeysInOptions(): array
+    {
+        return [
+            "in the connection's options" => [
+                ['options' => ['sentinel_password' => 'secret']],
+                [],
+                "sentinel_password must not be set in the connection's options: the package reads Sentinel settings only on the Sentinel connection itself.",
+            ],
+            'a default in the global options' => [
+                [],
+                ['sentinel_timeout' => 0.5],
+                'sentinel_timeout must not be set in the global Redis options: the package reads Sentinel settings only on the Sentinel connection itself.',
+            ],
+            'in another case' => [
+                ['options' => ['Sentinel_Timeout' => 0.5]],
+                [],
+                "Sentinel_Timeout must not be set in the connection's options: the package reads Sentinel settings only on the Sentinel connection itself.",
+            ],
+        ];
+    }
+
+    #[DataProvider('sentinelKeysNeverRead')]
+    public function test_a_sentinel_key_that_is_not_a_setting_is_refused_before_anything_is_contacted(string $key): void
+    {
+        // A misspelled sentinel_password would leave every probe anonymous, which only shows once an ACL is enforced.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+                ->connect($this->config('s1:26379', [$key => 'secret']), []);
+
+            $this->fail('Expected the key to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame(
+                "{$key} is not a Sentinel setting; the settings are sentinel_hosts, sentinel_service, sentinel_username,"
+                .' sentinel_password and sentinel_timeout.',
+                $exception->getMessage(),
+            );
+            $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame([], $this->clientHosts, 'no client is built');
+        }
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function sentinelKeysNeverRead(): array
+    {
+        return [
+            'misspelled' => ['sentinel_pasword'],
+            // Read with the exact case, so this one would be ignored just the same.
+            'in another case' => ['Sentinel_Password'],
+            'not a setting at all' => ['sentinel_retries'],
+        ];
+    }
+
     public function test_a_host_and_port_on_the_connection_itself_are_replaced_by_the_discovered_master(): void
     {
         // Laravel's stock connection block carries both; only the options are merged over the discovered address.

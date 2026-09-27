@@ -92,4 +92,47 @@ final class ConnectionSettingsTest extends TestCase
 
         $read();
     }
+
+    public function test_a_sentinel_key_is_any_key_with_the_prefix_in_any_case(): void
+    {
+        $this->assertTrue(ConnectionSettings::isSentinelKey('sentinel_hosts'));
+        $this->assertTrue(ConnectionSettings::isSentinelKey('sentinel_host'), 'a misspelled one too');
+        $this->assertTrue(ConnectionSettings::isSentinelKey('SENTINEL_HOSTS'));
+        $this->assertFalse(ConnectionSettings::isSentinelKey('retry_attempts'), 'the retry settings carry no prefix');
+        $this->assertFalse(ConnectionSettings::isSentinelKey('sentinel'));
+        $this->assertFalse(ConnectionSettings::isSentinelKey(0));
+    }
+
+    public function test_the_first_sentinel_key_of_an_array_is_found(): void
+    {
+        $this->assertSame('Sentinel_Service', ConnectionSettings::firstSentinelKey(['host' => 'h', 'Sentinel_Service' => 's', 'sentinel_hosts' => 'x']));
+        $this->assertNull(ConnectionSettings::firstSentinelKey(['host' => 'h', 'retry_attempts' => 3, 0 => 'sentinel_hosts']));
+    }
+
+    public function test_an_options_array_without_a_sentinel_key_passes(): void
+    {
+        ConnectionSettings::refuseSentinelKeysIn('the global Redis options', ['prefix' => 'app:', 'retry_attempts' => 3, 0 => 'x']);
+
+        $this->addToAssertionCount(1);
+    }
+
+    public function test_a_sentinel_key_in_an_options_array_is_refused_naming_the_place(): void
+    {
+        $this->expectExceptionObject(new SentinelConfigurationException(
+            "sentinel_timeout must not be set in the connection's options: the package reads Sentinel settings only on the Sentinel connection itself."
+        ));
+
+        ConnectionSettings::refuseSentinelKeysIn("the connection's options", ['sentinel_timeout' => 0.5]);
+    }
+
+    public function test_the_sentinel_settings_pass_and_any_other_sentinel_key_is_refused(): void
+    {
+        ConnectionSettings::refuseUnknownSentinelKeys(array_fill_keys(ConnectionSettings::SENTINEL_SETTINGS, 'x') + ['host' => '127.0.0.1']);
+
+        $this->expectExceptionObject(new SentinelConfigurationException(
+            'sentinel_hots is not a Sentinel setting; the settings are sentinel_hosts, sentinel_service, sentinel_username, sentinel_password and sentinel_timeout.'
+        ));
+
+        ConnectionSettings::refuseUnknownSentinelKeys(['sentinel_hots' => 's1']);
+    }
 }

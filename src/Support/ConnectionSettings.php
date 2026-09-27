@@ -7,7 +7,8 @@ namespace Tgi\LaravelPhpRedisSentinel\Support;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 
 /**
- * Reads a Sentinel connection's settings: the one place their types and defaults are checked.
+ * Reads a Sentinel connection's settings: the one place their types and defaults are checked. It also defines which
+ * `sentinel_` keys are the package's, and refuses one wherever the package does not read it.
  *
  * A scalar is cast as PHP casts it, unless the reader states a stricter rule; anything else is refused, naming the setting.
  * Socket waits are seconds and may be fractional, as phpredis takes them; the recovery budget is whole milliseconds,
@@ -26,6 +27,19 @@ final class ConnectionSettings
      * The data node's connect and read timeouts, in seconds, when they are not set.
      */
     private const float DEFAULT_DATA_NODE_TIMEOUT = 2.0;
+
+    /**
+     * The Sentinel settings, read on a Sentinel connection itself with the exact case.
+     *
+     * @var list<string>
+     */
+    public const array SENTINEL_SETTINGS = [
+        'sentinel_hosts',
+        'sentinel_service',
+        'sentinel_username',
+        'sentinel_password',
+        'sentinel_timeout',
+    ];
 
     /**
      * The `sentinel_timeout` setting, a sentinel probe's connect and read timeout, or its 0.5 s default when not set.
@@ -186,6 +200,77 @@ final class ConnectionSettings
         }
 
         return (int) $value;
+    }
+
+    /**
+     * Whether a configuration key belongs to the Sentinel settings' namespace, a known setting or a misspelled one.
+     *
+     * @phpstan-assert-if-true string $key
+     */
+    public static function isSentinelKey(int|string $key): bool
+    {
+        return is_string($key) && str_starts_with(strtolower($key), 'sentinel_');
+    }
+
+    /**
+     * Refuse a Sentinel setting in an options array, where the package never reads it, so it would be ignored.
+     *
+     * Matched on the `sentinel_` prefix in any case, not on the known keys, so a misspelled one is caught too.
+     *
+     * @param  string  $place  Which options array, for the message.
+     * @param  array<array-key, mixed>  $options
+     *
+     * @throws SentinelConfigurationException When the array holds a key starting with `sentinel_`.
+     */
+    public static function refuseSentinelKeysIn(string $place, array $options): void
+    {
+        $key = self::firstSentinelKey($options);
+
+        if ($key !== null) {
+            throw new SentinelConfigurationException(
+                "{$key} must not be set in {$place}: the package reads Sentinel settings only on the Sentinel connection itself."
+            );
+        }
+    }
+
+    /**
+     * The first key of an array that starts with `sentinel_`, in any case, or null when there is none.
+     *
+     * @param  array<array-key, mixed>  $settings
+     */
+    public static function firstSentinelKey(array $settings): ?string
+    {
+        foreach (array_keys($settings) as $key) {
+            if (self::isSentinelKey($key)) {
+                return $key;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Refuse a `sentinel_` key on a Sentinel connection that is not one of its settings, such as a misspelled
+     * `sentinel_password`, which would otherwise leave every sentinel probe anonymous without a word.
+     *
+     * Compared with the exact case, since the settings are read that way: `Sentinel_Password` is refused too.
+     *
+     * @param  array<array-key, mixed>  $config
+     *
+     * @throws SentinelConfigurationException When the connection holds a `sentinel_` key that is not a setting.
+     */
+    public static function refuseUnknownSentinelKeys(array $config): void
+    {
+        foreach (array_keys($config) as $key) {
+            if (self::isSentinelKey($key) && ! in_array($key, self::SENTINEL_SETTINGS, true)) {
+                throw new SentinelConfigurationException(sprintf(
+                    '%s is not a Sentinel setting; the settings are %s and %s.',
+                    $key,
+                    implode(', ', array_slice(self::SENTINEL_SETTINGS, 0, -1)),
+                    self::SENTINEL_SETTINGS[array_key_last(self::SENTINEL_SETTINGS)],
+                ));
+            }
+        }
     }
 
     /**

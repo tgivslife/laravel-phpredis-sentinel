@@ -47,11 +47,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      */
     private const array SENTINEL_CONFIG_KEYS = [
         'url',
-        'sentinel_hosts',
-        'sentinel_service',
-        'sentinel_username',
-        'sentinel_password',
-        'sentinel_timeout',
+        ...ConnectionSettings::SENTINEL_SETTINGS,
         'retry_attempts',
         'retry_delay',
         'retry_deadline',
@@ -133,6 +129,9 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
         self::refuseAddressIn("the connection's options", $formattedOptions);
         self::refuseAddressIn('the global Redis options', $options);
+        ConnectionSettings::refuseSentinelKeysIn("the connection's options", $formattedOptions);
+        ConnectionSettings::refuseSentinelKeysIn('the global Redis options', $options);
+        ConnectionSettings::refuseUnknownSentinelKeys($config);
         self::refuseCommandRetries($config);
 
         if (isset($config['prefix'])) {
@@ -279,6 +278,10 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
     /**
      * Sentinel manages a master and its replicas, never a Redis Cluster.
+     *
+     * Only a guard: the manager never calls it, since the topology connector hands every Cluster to Laravel's own
+     * connector. Kept because the method is inherited, and would otherwise build a Cluster when this connector is
+     * driven directly.
      *
      * @param  array<array-key, mixed>  $config
      * @param  array<array-key, mixed>  $clusterOptions
