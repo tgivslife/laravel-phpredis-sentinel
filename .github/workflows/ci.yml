@@ -139,5 +139,38 @@ jobs:
       - name: Install dependencies
         run: composer update --${{ matrix.stability }} --prefer-dist --no-interaction --no-progress
 
+      # If a dependency ever raised its own minimum, --prefer-lowest would quietly move past the declared floor, and
+      # the floor composer.json promises would no longer be tested anywhere. Every illuminate/* requirement must name
+      # the same ^major.minor floor, or one of them would promise a release the others rule out.
+      - name: Laravel floor
+        if: matrix.stability == 'prefer-lowest'
+        shell: bash
+        run: |
+          php -r '
+            $floors = [];
+            foreach (json_decode(file_get_contents("composer.json"), true)["require"] as $package => $constraint) {
+                if (str_starts_with($package, "illuminate/")) {
+                    $floors[$package] = preg_match("/^\^(\d+\.\d+)$/", $constraint, $m) === 1 ? $m[1].".0" : $constraint;
+                }
+            }
+            $floor = array_unique($floors);
+            if (count($floor) !== 1 || preg_match("/^\d+\.\d+\.0$/", (string) reset($floor)) !== 1) {
+                echo "::error title=Illuminate constraints disagree::every illuminate/* requirement must share one ^major.minor floor: ", json_encode($floors, JSON_UNESCAPED_SLASHES), PHP_EOL;
+                exit(1);
+            }
+            $floor = reset($floor);
+            foreach (json_decode(file_get_contents("vendor/composer/installed.json"), true)["packages"] as $package) {
+                if ($package["name"] === "laravel/framework") {
+                    $installed = ltrim($package["version"], "v");
+                }
+            }
+            $installed ??= "none";
+            echo "laravel/framework {$installed} (declared floor {$floor})", PHP_EOL;
+            if ($installed !== $floor) {
+                echo "::error title=Laravel floor not tested::--prefer-lowest resolved {$installed}, not the declared floor {$floor}: a dependency raised the minimum; review it, then raise the floor", PHP_EOL;
+                exit(1);
+            }
+          '
+
       - name: Unit and Feature suites
         run: vendor/bin/phpunit
