@@ -44,13 +44,109 @@ final class HostListParserTest extends TestCase
         );
     }
 
-    public function test_an_unbracketed_entry_with_several_colons_is_a_bare_address_on_the_default_port(): void
+    #[DataProvider('severalColonsButNoIpv6Address')]
+    public function test_an_unbracketed_entry_with_several_colons_must_be_an_ipv6_address(string $entry): void
     {
-        // Deliberate: without brackets, more than one colon can only be read safely as a bare IPv6 literal.
-        // An IPv4 typo such as a doubled port is therefore not caught here, only when connecting.
+        // A hostname holds no colon, so this is a typo; read as a bare address it would only fail when connecting.
+        $this->expectExceptionObject(new SentinelConfigurationException(
+            "Malformed host [{$entry}] in sentinel_hosts - only an IPv6 address holds several colons, and with a port it needs brackets, as in [fd00::1]:26379."
+        ));
+
+        $this->sentinelHosts()->parseHosts($entry);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function severalColonsButNoIpv6Address(): array
+    {
+        return [
+            'doubled port' => ['10.0.0.1:26379:26380'],
+            'IPv6 port without brackets' => ['fd00::1:26380'],
+            'hostname' => ['sentinel:a:b'],
+            'zone ID with a port' => ['fe80::1%eth0:26380'],
+            'empty zone ID' => ['fe80::1%'],
+        ];
+    }
+
+    public function test_an_unbracketed_ipv6_address_is_read_on_the_default_port(): void
+    {
         $this->assertSame(
-            [['10.0.0.1:26379:26380', 26379]],
-            $this->sentinelHosts()->parseHosts('10.0.0.1:26379:26380'),
+            [['fd00::1', 26379], ['::', 26379], ['::ffff:10.0.0.1', 26379], ['fe80::1%eth0', 26379]],
+            $this->sentinelHosts()->parseHosts('fd00::1, ::, ::ffff:10.0.0.1, fe80::1%eth0'),
+        );
+    }
+
+    #[DataProvider('emptyHosts')]
+    public function test_an_empty_host_is_refused(string $entry): void
+    {
+        $this->expectExceptionObject(new SentinelConfigurationException("Empty host in sentinel_hosts entry [{$entry}]."));
+
+        $this->sentinelHosts()->parseHosts($entry);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function emptyHosts(): array
+    {
+        return [
+            'brackets' => ['[]'],
+            'brackets with a port' => ['[]:26380'],
+            'brackets and a colon' => ['[]:'],
+            'port only' => [':26380'],
+            'colon only' => [':'],
+        ];
+    }
+
+    #[DataProvider('bracketTails')]
+    public function test_a_closing_bracket_can_only_be_followed_by_a_port(string $entry, string $message): void
+    {
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
+
+        $this->sentinelHosts()->parseHosts($entry);
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function bracketTails(): array
+    {
+        return [
+            'port without its colon' => ['[fd00::1]26380', 'Malformed host [[fd00::1]26380] in sentinel_hosts - a bracketed IPv6 literal can only be followed by :port.'],
+            'two colons' => ['[fd00::1]::26380', 'Invalid port [:26380] in sentinel_hosts entry [[fd00::1]::26380].'],
+        ];
+    }
+
+    #[DataProvider('bracketsAroundMoreThanAnIpv6Address')]
+    public function test_brackets_with_a_colon_inside_must_hold_an_ipv6_address(string $entry): void
+    {
+        // A port inside the brackets is as easy a mistake as no brackets at all.
+        $this->expectExceptionObject(new SentinelConfigurationException(
+            "Malformed host [{$entry}] in sentinel_hosts - brackets hold an IPv6 address; the port goes after them, as in [fd00::1]:26379."
+        ));
+
+        $this->sentinelHosts()->parseHosts($entry);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function bracketsAroundMoreThanAnIpv6Address(): array
+    {
+        return [
+            'IPv6 port inside' => ['[fd00::1:26380]'],
+            'IPv4 port inside' => ['[10.0.0.1:26379]'],
+            'hostname with colons' => ['[sentinel:a:b]'],
+            'zone ID with a port inside' => ['[fe80::1%eth0:26380]'],
+        ];
+    }
+
+    public function test_brackets_may_hold_a_host_name_or_an_ipv6_address_with_a_zone_id(): void
+    {
+        $this->assertSame(
+            [['redis-sentinel', 26380], ['fe80::1%eth0', 26380], ['::ffff:10.0.0.1', 26379]],
+            $this->sentinelHosts()->parseHosts('[redis-sentinel]:26380, [fe80::1%eth0]:26380, [::ffff:10.0.0.1]'),
         );
     }
 
@@ -82,6 +178,25 @@ final class HostListParserTest extends TestCase
         $this->expectExceptionObject(new SentinelConfigurationException('Invalid port [abc] in other_hosts entry [host:abc].'));
 
         $otherList->parseHosts('host:abc');
+    }
+
+    #[DataProvider('bracketAdvice')]
+    public function test_the_bracket_example_uses_the_list_default_port(string $entry, string $message): void
+    {
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
+
+        (new HostListParser('other_hosts', 6379))->parseHosts($entry);
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function bracketAdvice(): array
+    {
+        return [
+            'several colons' => ['10.0.0.1:7001:7002', 'Malformed host [10.0.0.1:7001:7002] in other_hosts - only an IPv6 address holds several colons, and with a port it needs brackets, as in [fd00::1]:6379.'],
+            'port inside the brackets' => ['[10.0.0.1:7001]', 'Malformed host [[10.0.0.1:7001]] in other_hosts - brackets hold an IPv6 address; the port goes after them, as in [fd00::1]:6379.'],
+        ];
     }
 
     #[DataProvider('unusablePorts')]
