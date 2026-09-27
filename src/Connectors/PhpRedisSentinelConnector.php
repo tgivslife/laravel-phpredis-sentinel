@@ -10,6 +10,7 @@ use Psr\Log\LoggerInterface;
 use Redis;
 use RedisException;
 use RedisSentinel;
+use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Discovery\SentinelClientFactory;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
@@ -20,6 +21,7 @@ use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
 use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
+use Tgi\LaravelPhpRedisSentinel\Support\PhpRedisVersion;
 use Throwable;
 
 /**
@@ -117,9 +119,12 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @throws SentinelDiscoveryException When no sentinel answers.
      * @throws SentinelFailoverException When the retry budget is spent, or at the first failover while retries are suppressed.
      * @throws RedisException When the master refuses setup for a reason that is not a failover, such as a wrong password.
+     * @throws RuntimeException When phpredis is missing or older than the package supports.
      */
     public function connect(array $config, array $options): PhpRedisSentinelConnection
     {
+        PhpRedisVersion::refuseOlder(phpversion('redis'));
+
         $formattedOptions = $config['options'] ?? [];
         unset($config['options']);
 

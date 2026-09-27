@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Discovery;
 
 use RedisSentinel;
+use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
 use Tgi\LaravelPhpRedisSentinel\Support\HostListParser;
+use Tgi\LaravelPhpRedisSentinel\Support\PhpRedisVersion;
 
 /**
  * Builds RedisSentinel clients from a `database.redis.*` connection configuration.
@@ -34,9 +36,12 @@ final class SentinelClientFactory
      * @param  array<string, mixed>  $config
      *
      * @throws SentinelConfigurationException When a sentinel setting is unusable; see options().
+     * @throws RuntimeException When phpredis is missing or older than the package supports.
      */
     public function make(string $host, int $port, array $config): RedisSentinel
     {
+        PhpRedisVersion::refuseOlder(phpversion('redis'));
+
         return new RedisSentinel($this->options($host, $port, $config));
     }
 
