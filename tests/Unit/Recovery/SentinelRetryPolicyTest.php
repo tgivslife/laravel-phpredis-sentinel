@@ -8,6 +8,7 @@ use ErrorException;
 use PHPUnit\Framework\TestCase;
 use RedisException;
 use RuntimeException;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
@@ -478,9 +479,37 @@ final class SentinelRetryPolicyTest extends TestCase
 
     public function test_a_retry_setting_that_is_not_a_scalar_is_refused(): void
     {
-        $this->expectExceptionObject(new RuntimeException('retry_attempts must be a number, array given.'));
+        $this->expectExceptionObject(new SentinelConfigurationException('retry_attempts must be a number, array given.'));
 
         SentinelRetryPolicy::fromConfig(['retry_attempts' => [3]], $this->logger);
+    }
+
+    public function test_a_configuration_error_is_not_retried_whatever_its_message(): void
+    {
+        // The message quotes the offending value, and this host holds the `socket` fragment.
+        $error = new SentinelConfigurationException('Invalid port [abc] in sentinel_hosts entry [socket.internal:abc].');
+        $calls = 0;
+
+        $this->assertTrue($this->policy()->isRetryable(new RedisException($error->getMessage())), 'the message alone would be retried');
+        $this->assertFalse($this->policy()->isRetryable($error));
+
+        try {
+            $this->policy()->run(
+                function () use ($error, &$calls): never {
+                    $calls++;
+
+                    throw $error;
+                },
+                static fn () => null,
+                'test',
+            );
+
+            $this->fail('Expected the configuration error to propagate.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame($error, $exception);
+            $this->assertSame(1, $calls, 'a configuration error must not be retried');
+            $this->assertSame([], $this->logger->warnings());
+        }
     }
 
     public function test_a_subscription_older_than_the_deadline_still_gets_its_retries(): void

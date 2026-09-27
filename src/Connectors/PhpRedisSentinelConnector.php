@@ -10,14 +10,16 @@ use Psr\Log\LoggerInterface;
 use Redis;
 use RedisException;
 use RedisSentinel;
-use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Discovery\SentinelClientFactory;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Recovery\MonotonicClock;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SystemClock;
+use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
 use Tgi\LaravelPhpRedisSentinel\Support\ReadTimeout;
 use Throwable;
 
@@ -107,15 +109,19 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     }
 
     /**
-     * Create a connection to the current master.
+     * Connect to the current master.
      *
-     * The connection keeps a client factory that rediscovers unless called with `false`, which only the first attempt
-     * of each connect() does; Laravel's closure pins the address it started with, after a failover the old master.
+     * The connection gets a client factory that rediscovers the master; only the first attempt of each connect()
+     * passes `false`, which lets it use the cached address. Laravel's closure pins the address it started with,
+     * the old master after a failover.
      *
-     * @param  array<string, mixed>  $config  The connection configuration (a `database.redis.*` entry).
+     * @param  array<string, mixed>  $config  A `database.redis.*` connection entry.
      * @param  array<string, mixed>  $options  The `database.redis.options` array.
      *
-     * @throws RuntimeException When the configuration is unusable.
+     * @throws SentinelConfigurationException When the configuration is unusable.
+     * @throws SentinelDiscoveryException When no sentinel answers.
+     * @throws SentinelFailoverException When the retry budget is spent, or at the first failover while retries are suppressed.
+     * @throws RedisException When the master refuses setup for a reason that is not a failover, such as a wrong password.
      */
     public function connect(array $config, array $options): PhpRedisSentinelConnection
     {
@@ -123,15 +129,15 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         unset($config['options']);
 
         if (! is_array($formattedOptions)) {
-            throw new RuntimeException(sprintf('options must be an array, %s given.', get_debug_type($formattedOptions)));
+            throw new SentinelConfigurationException(sprintf('options must be an array, %s given.', get_debug_type($formattedOptions)));
         }
 
         if (isset($config['prefix'])) {
             $formattedOptions['prefix'] = $config['prefix'];
         }
 
-        $service = self::stringSetting($config, 'sentinel_service', 'mymaster');
-        $hosts = $this->sentinelClients->parseHosts(self::hostList($config));
+        $service = ConnectionSettings::string($config, 'sentinel_service', 'mymaster');
+        $hosts = $this->sentinelClients->parseHosts(ConnectionSettings::hostList($config));
         $cacheKey = self::masterCacheKey($service, $hosts, $config);
 
         $connector = function (bool $refresh = true, ?RecoveryDeadline $deadline = null) use (
@@ -165,7 +171,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                     }
                 } finally {
                     if ($deadline !== null) {
-                        $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(self::floatSetting($clientConfig, 'read_timeout', 0.0)));
+                        $client->setOption(Redis::OPT_READ_TIMEOUT, ReadTimeout::effective(ConnectionSettings::float($clientConfig, 'read_timeout', 0.0)));
                     }
                 }
             } catch (Throwable $exception) {
@@ -220,11 +226,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  array<array-key, mixed>  $clusterOptions
      * @param  array<array-key, mixed>  $options
      *
-     * @throws RuntimeException Always.
+     * @throws SentinelConfigurationException Always.
      */
     public function connectToCluster(array $config, array $clusterOptions, array $options): never
     {
-        throw new RuntimeException(
+        throw new SentinelConfigurationException(
             'A Sentinel connection cannot be a Redis Cluster: define the cluster under `clusters`, without sentinel_hosts.'
         );
     }
@@ -238,7 +244,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  array<array-key, mixed>  $config
      *
      * @throws SentinelDiscoveryException Retryable: the deadline was spent before a stage started.
-     * @throws RuntimeException When a credential or the database is not a scalar.
+     * @throws SentinelConfigurationException When a credential or the database is not a scalar.
      */
     private function sendSetupCommands(Redis $client, array $config, ?RecoveryDeadline $deadline, string $node): void
     {
@@ -251,7 +257,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         }
 
         if (isset($config['database'])) {
-            $database = self::intSetting($config, 'database');
+            $database = ConnectionSettings::int($config, 'database', 0);
 
             $this->stage($client, $config, $deadline, "SELECT on [{$node}]", static function () use ($client, $database): void {
                 $client->select($database);
@@ -285,7 +291,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 );
             }
 
-            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(ReadTimeout::effective(self::floatSetting($config, 'read_timeout', 0.0))));
+            $client->setOption(Redis::OPT_READ_TIMEOUT, $deadline->clamp(ReadTimeout::effective(ConnectionSettings::float($config, 'read_timeout', 0.0))));
         }
 
         $run();
@@ -299,7 +305,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  array<array-key, mixed>  $config
      * @return string|array<array-key, string>
      *
-     * @throws RuntimeException When a credential is not a scalar.
+     * @throws SentinelConfigurationException When a credential is not a scalar.
      */
     private static function credentials(array $config): string|array
     {
@@ -307,26 +313,14 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         $password = $config['password'] ?? null;
 
         if ($username !== null && $username !== '' && is_string($password)) {
-            return [self::credential($username, 'username'), $password];
+            return [ConnectionSettings::stringValue($username, 'username'), $password];
         }
 
         if (is_array($password)) {
-            return array_map(static fn (mixed $part): string => self::credential($part, 'password'), $password);
+            return array_map(static fn (mixed $part): string => ConnectionSettings::stringValue($part, 'password'), $password);
         }
 
-        return self::credential($password, 'password');
-    }
-
-    /**
-     * @throws RuntimeException When the value is not a scalar.
-     */
-    private static function credential(mixed $value, string $key): string
-    {
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a string, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (string) $value;
+        return ConnectionSettings::stringValue($password, 'password');
     }
 
     /**
@@ -374,7 +368,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @return array{0: string, 1: int}
      *
      * @throws SentinelDiscoveryException When no sentinel names a usable master.
-     * @throws RuntimeException When no sentinel host is configured, or a setting is malformed.
+     * @throws SentinelConfigurationException When no sentinel host is configured, or a setting is malformed.
      */
     private function resolveMaster(
         array $config,
@@ -389,7 +383,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
         }
 
         if ($hosts === []) {
-            throw new RuntimeException('No Redis sentinel hosts configured: set sentinel_hosts.');
+            throw new SentinelConfigurationException('No Redis sentinel hosts configured: set sentinel_hosts.');
         }
 
         $failures = [];
@@ -447,13 +441,13 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
      * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
      * @param  array<string, mixed>  $config
      *
-     * @throws RuntimeException When a credential is not a scalar.
+     * @throws SentinelConfigurationException When a credential is not a scalar.
      */
     private static function masterCacheKey(string $service, array $hosts, array $config): string
     {
         $credentials = hash('sha256', serialize([
-            self::stringSetting($config, 'sentinel_username', ''),
-            self::stringSetting($config, 'sentinel_password', ''),
+            ConnectionSettings::string($config, 'sentinel_username', ''),
+            ConnectionSettings::string($config, 'sentinel_password', ''),
         ]));
 
         return $service
@@ -490,7 +484,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     private function clampSentinelTimeout(array $config, ?RecoveryDeadline $deadline): array
     {
         if ($deadline !== null) {
-            $config['sentinel_timeout'] = $deadline->clamp(self::floatSetting($config, 'sentinel_timeout', 0.5));
+            $config['sentinel_timeout'] = $deadline->clamp(ConnectionSettings::sentinelTimeout($config));
         }
 
         return $config;
@@ -505,97 +499,10 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     private function clampClientTimeouts(array $config, ?RecoveryDeadline $deadline): array
     {
         if ($deadline !== null) {
-            $config['timeout'] = $deadline->clamp(self::floatSetting($config, 'timeout', 0.0));
-            $config['read_timeout'] = $deadline->clamp(ReadTimeout::effective(self::floatSetting($config, 'read_timeout', 0.0)));
+            $config['timeout'] = $deadline->clamp(ConnectionSettings::float($config, 'timeout', 0.0));
+            $config['read_timeout'] = $deadline->clamp(ReadTimeout::effective(ConnectionSettings::float($config, 'read_timeout', 0.0)));
         }
 
         return $config;
-    }
-
-    /**
-     * The sentinel host list, as a string or a list of scalars.
-     *
-     * @param  array<string, mixed>  $config
-     * @return string|array<array-key, scalar|null>
-     *
-     * @throws RuntimeException When the setting is neither.
-     */
-    private static function hostList(array $config): string|array
-    {
-        $hosts = $config['sentinel_hosts'] ?? '';
-
-        if (is_string($hosts)) {
-            return $hosts;
-        }
-
-        if (! is_array($hosts)) {
-            throw new RuntimeException(sprintf('sentinel_hosts must be a string or a list, %s given.', get_debug_type($hosts)));
-        }
-
-        $list = [];
-
-        foreach ($hosts as $key => $host) {
-            if (! is_scalar($host) && $host !== null) {
-                throw new RuntimeException(sprintf('sentinel_hosts entries must be strings, %s given.', get_debug_type($host)));
-            }
-
-            $list[$key] = $host;
-        }
-
-        return $list;
-    }
-
-    /**
-     * A string setting, cast as before; anything that is not a scalar is refused rather than cast.
-     *
-     * @param  array<string, mixed>  $config
-     *
-     * @throws RuntimeException When the setting is not a scalar.
-     */
-    private static function stringSetting(array $config, string $key, string $default): string
-    {
-        $value = $config[$key] ?? $default;
-
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a string, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (string) $value;
-    }
-
-    /**
-     * An integer setting, cast as before; anything that is not a scalar is refused rather than cast.
-     *
-     * @param  array<array-key, mixed>  $config
-     *
-     * @throws RuntimeException When the setting is not a scalar.
-     */
-    private static function intSetting(array $config, string $key): int
-    {
-        $value = $config[$key] ?? 0;
-
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a number, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (int) $value;
-    }
-
-    /**
-     * A number setting, cast as before; anything that is not a scalar is refused rather than cast.
-     *
-     * @param  array<array-key, mixed>  $config
-     *
-     * @throws RuntimeException When the setting is not a scalar.
-     */
-    private static function floatSetting(array $config, string $key, float $default): float
-    {
-        $value = $config[$key] ?? $default;
-
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a number, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (float) $value;
     }
 }

@@ -6,7 +6,7 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Support;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
-use RuntimeException;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Support\HostListParser;
 
 final class HostListParserTest extends TestCase
@@ -79,7 +79,7 @@ final class HostListParserTest extends TestCase
             $otherList->parseHosts('[fd00::1]:7001,fd00::2'),
         );
 
-        $this->expectExceptionObject(new RuntimeException('Invalid port [abc] in other_hosts entry [host:abc].'));
+        $this->expectExceptionObject(new SentinelConfigurationException('Invalid port [abc] in other_hosts entry [host:abc].'));
 
         $otherList->parseHosts('host:abc');
     }
@@ -88,7 +88,7 @@ final class HostListParserTest extends TestCase
     public function test_it_refuses_a_port_it_cannot_use_instead_of_defaulting(string $entry, string $port): void
     {
         // Silently falling back to the default turns "wrong port" into "mysteriously unreachable host" later.
-        $this->expectExceptionObject(new RuntimeException("Invalid port [{$port}] in sentinel_hosts entry [{$entry}]."));
+        $this->expectExceptionObject(new SentinelConfigurationException("Invalid port [{$port}] in sentinel_hosts entry [{$entry}]."));
 
         $this->sentinelHosts()->parseHosts($entry);
     }
@@ -109,7 +109,7 @@ final class HostListParserTest extends TestCase
 
     public function test_it_refuses_an_unclosed_ipv6_bracket(): void
     {
-        $this->expectExceptionObject(new RuntimeException('Malformed host [[fd00::1] in sentinel_hosts - a bracketed IPv6 literal needs its closing bracket.'));
+        $this->expectExceptionObject(new SentinelConfigurationException('Malformed host [[fd00::1] in sentinel_hosts - a bracketed IPv6 literal needs its closing bracket.'));
 
         $this->sentinelHosts()->parseHosts('[fd00::1');
     }

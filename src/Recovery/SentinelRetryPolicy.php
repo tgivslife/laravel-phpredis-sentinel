@@ -8,11 +8,12 @@ use ErrorException;
 use Illuminate\Support\Str;
 use Psr\Log\LoggerInterface;
 use RedisException;
-use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
+use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
 use Throwable;
 
 /**
@@ -97,15 +98,15 @@ final class SentinelRetryPolicy
      *
      * @param  array<string, mixed>  $config  The connection configuration, discovery keys included.
      *
-     * @throws RuntimeException When a retry setting is not a scalar.
+     * @throws SentinelConfigurationException When a retry setting is not a scalar.
      */
     public static function fromConfig(array $config, LoggerInterface $logger, MonotonicClock $clock = new SystemClock): self
     {
         return new self(
             $logger,
-            max(self::intSetting($config, 'retry_attempts', 3), 0),
-            max(self::intSetting($config, 'retry_delay', 500), 0),
-            max(self::intSetting($config, 'retry_deadline', 5000), 0),
+            max(ConnectionSettings::int($config, 'retry_attempts', 3), 0),
+            max(ConnectionSettings::int($config, 'retry_delay', 500), 0),
+            max(ConnectionSettings::int($config, 'retry_deadline', 5000), 0),
             clock: $clock,
         );
     }
@@ -268,23 +269,5 @@ final class SentinelRetryPolicy
     private function elapsedMs(int $startedAt): int
     {
         return intdiv($this->clock->now() - $startedAt, 1_000_000);
-    }
-
-    /**
-     * An integer setting, cast as before; anything that is not a scalar is refused rather than cast.
-     *
-     * @param  array<string, mixed>  $config
-     *
-     * @throws RuntimeException When the setting is not a scalar.
-     */
-    private static function intSetting(array $config, string $key, int $default): int
-    {
-        $value = $config[$key] ?? $default;
-
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a number, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (int) $value;
     }
 }

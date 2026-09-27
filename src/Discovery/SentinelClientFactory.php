@@ -5,14 +5,14 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Discovery;
 
 use RedisSentinel;
-use RuntimeException;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
+use Tgi\LaravelPhpRedisSentinel\Support\ConnectionSettings;
 use Tgi\LaravelPhpRedisSentinel\Support\HostListParser;
 
 /**
  * Builds RedisSentinel clients from a `database.redis.*` connection configuration.
  *
  * Everything that talks to the sentinels goes through here, so host parsing and ACL semantics are defined once.
- * The probe timeout's 0.5 s default is also in the connector, which cuts it to the recovery deadline.
  * Used by the connector to discover the master, and by applications that inspect the sentinel fleet with the same settings.
  *
  * @api
@@ -32,6 +32,8 @@ final class SentinelClientFactory
      * A client for a single sentinel. It connects lazily, on its first command.
      *
      * @param  array<string, mixed>  $config
+     *
+     * @throws SentinelConfigurationException When a sentinel setting is unusable; see options().
      */
     public function make(string $host, int $port, array $config): RedisSentinel
     {
@@ -43,6 +45,8 @@ final class SentinelClientFactory
      *
      * @param  string|array<array-key, scalar|null>  $hosts
      * @return list<array{0: string, 1: int}>
+     *
+     * @throws SentinelConfigurationException When an entry is malformed or names an illegal port.
      */
     public function parseHosts(string|array $hosts): array
     {
@@ -60,18 +64,12 @@ final class SentinelClientFactory
      * @param  array<string, mixed>  $config
      * @return array{host: string, port: int, connectTimeout: float, readTimeout: float, auth?: string|array{0: string, 1: string}}
      *
-     * @throws RuntimeException When only one half of the sentinel credentials is configured, or a sentinel
-     *                          setting is not a scalar.
+     * @throws SentinelConfigurationException When only one half of the sentinel credentials is configured, or a
+     *                                        sentinel setting is not a scalar.
      */
     public function options(string $host, int $port, array $config): array
     {
-        $timeout = $config['sentinel_timeout'] ?? 0.5;
-
-        if (! is_scalar($timeout)) {
-            throw new RuntimeException(sprintf('sentinel_timeout must be a number, %s given.', get_debug_type($timeout)));
-        }
-
-        $timeout = (float) $timeout;
+        $timeout = ConnectionSettings::sentinelTimeout($config);
 
         $options = [
             'host' => $host,
@@ -80,11 +78,11 @@ final class SentinelClientFactory
             'readTimeout' => $timeout,
         ];
 
-        $username = trim($this->stringSetting($config, 'sentinel_username'));
-        $password = trim($this->stringSetting($config, 'sentinel_password'));
+        $username = trim(ConnectionSettings::string($config, 'sentinel_username', ''));
+        $password = trim(ConnectionSettings::string($config, 'sentinel_password', ''));
 
         if ($username !== '' && $password === '') {
-            throw new RuntimeException(
+            throw new SentinelConfigurationException(
                 'sentinel_username is set without sentinel_password - set both, or neither.'
             );
         }
@@ -96,23 +94,5 @@ final class SentinelClientFactory
         }
 
         return $options;
-    }
-
-    /**
-     * A string setting, cast as before; anything that is not a scalar is refused rather than dropped.
-     *
-     * @param  array<string, mixed>  $config
-     *
-     * @throws RuntimeException When the setting is not a scalar.
-     */
-    private function stringSetting(array $config, string $key): string
-    {
-        $value = $config[$key] ?? '';
-
-        if (! is_scalar($value)) {
-            throw new RuntimeException(sprintf('%s must be a string, %s given.', $key, get_debug_type($value)));
-        }
-
-        return (string) $value;
     }
 }

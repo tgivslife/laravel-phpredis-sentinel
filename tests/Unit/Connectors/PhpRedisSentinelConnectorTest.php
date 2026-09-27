@@ -12,9 +12,9 @@ use Redis;
 use RedisException;
 use RedisSentinel;
 use ReflectionProperty;
-use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\FakeClock;
@@ -257,7 +257,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
 
     public function test_rejects_an_empty_sentinel_host_list(): void
     {
-        $this->expectExceptionObject(new RuntimeException('No Redis sentinel hosts configured: set sentinel_hosts.'));
+        $this->expectExceptionObject(new SentinelConfigurationException('No Redis sentinel hosts configured: set sentinel_hosts.'));
 
         $this->connector([])->connect($this->config(''), []);
     }
@@ -290,7 +290,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
     #[DataProvider('malformedSettings')]
     public function test_a_malformed_setting_is_refused_naming_it(array $override, string $message): void
     {
-        $this->expectExceptionObject(new RuntimeException($message));
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
 
         // array_replace, not +: the override must win over the helper's sentinel_hosts and sentinel_service.
         $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
@@ -999,7 +999,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
 
     public function test_cluster_connections_are_refused_with_a_named_error(): void
     {
-        $this->expectExceptionObject(new RuntimeException(
+        $this->expectExceptionObject(new SentinelConfigurationException(
             'A Sentinel connection cannot be a Redis Cluster: define the cluster under `clusters`, without sentinel_hosts.'
         ));
 

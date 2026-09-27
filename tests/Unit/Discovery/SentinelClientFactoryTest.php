@@ -7,8 +7,8 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Discovery;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RedisSentinel;
-use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Discovery\SentinelClientFactory;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelConfigurationException;
 
 /**
  * Sentinel options and auth, and the host list the factory reads with.
@@ -41,7 +41,7 @@ final class SentinelClientFactoryTest extends TestCase
 
     public function test_host_list_errors_name_the_sentinel_hosts_setting(): void
     {
-        $this->expectExceptionObject(new RuntimeException('Invalid port [abc] in sentinel_hosts entry [s1:abc].'));
+        $this->expectExceptionObject(new SentinelConfigurationException('Invalid port [abc] in sentinel_hosts entry [s1:abc].'));
 
         $this->factory->parseHosts('s1:abc');
     }
@@ -73,7 +73,7 @@ final class SentinelClientFactoryTest extends TestCase
     {
         // A username alone authenticates nothing; contacting the sentinels anonymously instead would only
         // surface the day an ACL starts being enforced.
-        $this->expectExceptionObject(new RuntimeException('sentinel_username is set without sentinel_password - set both, or neither.'));
+        $this->expectExceptionObject(new SentinelConfigurationException('sentinel_username is set without sentinel_password - set both, or neither.'));
 
         $this->factory->options('s1', 26379, ['sentinel_username' => 'ops']);
     }
@@ -85,7 +85,7 @@ final class SentinelClientFactoryTest extends TestCase
     public function test_a_setting_that_is_not_a_scalar_is_refused_rather_than_dropped(array $config, string $message): void
     {
         // Falling back instead would turn a malformed password into an anonymous connection.
-        $this->expectExceptionObject(new RuntimeException($message));
+        $this->expectExceptionObject(new SentinelConfigurationException($message));
 
         $this->factory->options('s1', 26379, $config);
     }
