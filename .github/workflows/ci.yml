@@ -6,6 +6,10 @@ on:
       - main
       - '*.x'
   pull_request:
+  # Weekly, so a Laravel or phpredis release is tested before an application upgrades to it, commit or not.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,7 +20,9 @@ concurrency:
 
 env:
   minimum_php: '8.3'
-  extensions: dom, curl, libxml, mbstring, zip, fileinfo, sqlite3, pdo_sqlite, redis-6.3.0
+  extensions: dom, curl, libxml, mbstring, zip, fileinfo, sqlite3, pdo_sqlite
+  # The declared floor (ext-redis ^6.3). Jobs that test the newest dependencies take the newest phpredis instead.
+  minimum_redis: redis-6.3.0
 
 jobs:
   static:
@@ -33,7 +39,7 @@ jobs:
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: ${{ env.minimum_php }}
-          extensions: ${{ env.extensions }}
+          extensions: ${{ env.extensions }}, ${{ env.minimum_redis }}
           ini-values: error_reporting=E_ALL
           tools: composer:v2
           coverage: none
@@ -66,7 +72,7 @@ jobs:
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: ${{ env.minimum_php }}
-          extensions: ${{ env.extensions }}
+          extensions: ${{ env.extensions }}, ${{ env.minimum_redis }}
           tools: composer:v2, composer-dependency-analyser
           coverage: none
         env:
@@ -110,12 +116,25 @@ jobs:
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: ${{ env.extensions }}
+          # The floor with the lowest dependencies; otherwise the newest phpredis the runner's source offers.
+          extensions: ${{ env.extensions }}, ${{ matrix.stability == 'prefer-lowest' && env.minimum_redis || 'redis' }}
           ini-values: error_reporting=E_ALL
           tools: composer:v2
           coverage: none
         env:
           fail-fast: true
+
+      # A green run's log goes unread, so a runner whose source trails PECL is reported as a warning annotation,
+      # which the run's summary shows; the job stays green, since the lag is the runner's, not the package's.
+      - name: phpredis version
+        shell: bash
+        run: |
+          loaded=$(php -r "echo phpversion('redis');")
+          newest=$(curl -fsS -m 20 https://pecl.php.net/rest/r/redis/stable.txt || echo unknown)
+          echo "phpredis ${loaded} (newest stable on PECL: ${newest})"
+          if [ '${{ matrix.stability }}' = prefer-stable ] && [ "${newest}" != unknown ] && [ "${loaded}" != "${newest}" ]; then
+            echo "::warning title=phpredis behind PECL::${loaded} is loaded; PECL's newest stable is ${newest}, which the runner's source does not offer yet"
+          fi
 
       - name: Install dependencies
         run: composer update --${{ matrix.stability }} --prefer-dist --no-interaction --no-progress
