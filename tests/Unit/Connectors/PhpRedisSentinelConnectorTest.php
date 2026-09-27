@@ -332,6 +332,77 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         $this->assertSame(['10.0.0.9:6380'], $this->clientHosts);
     }
 
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('commandRetriesThatAskForNothing')]
+    public function test_a_command_retries_that_asks_for_nothing_is_accepted(array $settings, array $options): void
+    {
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', $settings), $options);
+
+        $this->assertSame(['10.0.0.9:6380'], $this->clientHosts);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>}>
+     */
+    public static function commandRetriesThatAskForNothing(): array
+    {
+        return [
+            'null' => [['command_retries' => null], []],
+            'zero' => [['command_retries' => 0], []],
+            'zero as env() returns it' => [['command_retries' => '0'], []],
+            'a body shared with standalone connections' => [
+                ['host' => '127.0.0.1', 'port' => '6379', 'database' => '0', 'max_retries' => '1', 'command_retries' => '0'],
+                [],
+            ],
+            // Only a Cluster connection reads it from the options.
+            "any value in the connection's options" => [['options' => ['command_retries' => 3]], []],
+            'any value in the global options' => [[], ['command_retries' => 3]],
+        ];
+    }
+
+    #[DataProvider('commandRetriesThatAskForSomething')]
+    public function test_a_command_retries_that_asks_for_something_is_refused_before_anything_is_contacted(mixed $retries, string $given): void
+    {
+        // Laravel's command() loop reads it on a standalone connection; a Sentinel connection never runs that loop.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+                ->connect($this->config('s1:26379', ['command_retries' => $retries]), []);
+
+            $this->fail('Expected command_retries to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame(
+                "command_retries has no effect on a Sentinel connection, {$given} given: the package retries failovers itself,"
+                .' so set retry_attempts instead, or leave command_retries at 0.',
+                $exception->getMessage(),
+            );
+            $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame([], $this->clientHosts, 'no client is built');
+        }
+    }
+
+    /**
+     * @return array<string, array{mixed, string}>
+     */
+    public static function commandRetriesThatAskForSomething(): array
+    {
+        return [
+            'a count' => [3, '3'],
+            'a count as env() returns it' => ['3', "'3'"],
+            'negative' => [-1, '-1'],
+            'a fraction' => [0.5, '0.5'],
+            'not a number' => ['abc', "'abc'"],
+            // Laravel's (int) cast reads these two as 0; refused like a blank retry_delay or timeout.
+            'empty, as a blank env()' => ['', "''"],
+            'false' => [false, 'false'],
+            'boolean' => [true, 'true'],
+            'not a scalar' => [[3], 'array'],
+        ];
+    }
+
     public function test_a_sentinel_timeout_is_refused_at_connect_even_when_the_master_is_cached(): void
     {
         // It is not part of the cache key, and a cache hit asks no sentinel: checked only in a probe, this connection

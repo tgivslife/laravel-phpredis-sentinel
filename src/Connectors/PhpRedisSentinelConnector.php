@@ -133,6 +133,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
         self::refuseAddressIn("the connection's options", $formattedOptions);
         self::refuseAddressIn('the global Redis options', $options);
+        self::refuseCommandRetries($config);
 
         if (isset($config['prefix'])) {
             $formattedOptions['prefix'] = $config['prefix'];
@@ -247,6 +248,33 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                 );
             }
         }
+    }
+
+    /**
+     * Refuse a `command_retries` that asks for something: on a standalone connection Laravel's command() loop reads
+     * it, but a Sentinel connection retries through the package's own loop, so it would have no effect.
+     *
+     * Null and 0 are Laravel's default and ask for nothing, so they pass: a config that builds Sentinel and
+     * standalone connections from one shared array carries them. A numeric string counts by its value, as `env()` returns one.
+     * Inside `options` the key is not read here: only a Cluster connection reads it there.
+     *
+     * @param  array<array-key, mixed>  $config
+     *
+     * @throws SentinelConfigurationException When the setting is anything but null or a numeric 0.
+     */
+    private static function refuseCommandRetries(array $config): void
+    {
+        $value = $config['command_retries'] ?? null;
+
+        if ($value === null || (is_numeric($value) && (float) $value === 0.0)) {
+            return;
+        }
+
+        throw new SentinelConfigurationException(sprintf(
+            'command_retries has no effect on a Sentinel connection, %s given: the package retries failovers itself,'
+            .' so set retry_attempts instead, or leave command_retries at 0.',
+            is_scalar($value) ? var_export($value, true) : get_debug_type($value),
+        ));
     }
 
     /**
