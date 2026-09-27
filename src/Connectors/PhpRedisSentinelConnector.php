@@ -131,6 +131,9 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             throw new SentinelConfigurationException(sprintf('options must be an array, %s given.', get_debug_type($formattedOptions)));
         }
 
+        self::refuseAddressIn("the connection's options", $formattedOptions);
+        self::refuseAddressIn('the global Redis options', $options);
+
         if (isset($config['prefix'])) {
             $formattedOptions['prefix'] = $config['prefix'];
         }
@@ -224,6 +227,26 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     private static function withoutDiscoveryKeys(array $config): array
     {
         return array_diff_key($config, array_flip(self::SENTINEL_CONFIG_KEYS));
+    }
+
+    /**
+     * Refuse an address in an options array: both are merged over the discovered master, as Laravel lets options
+     * override the connection.
+     *
+     * @param  string  $place  Which options array, for the message.
+     * @param  array<array-key, mixed>  $options
+     *
+     * @throws SentinelConfigurationException When the array sets `host` or `port`, even to null.
+     */
+    private static function refuseAddressIn(string $place, array $options): void
+    {
+        foreach (['host', 'port'] as $key) {
+            if (array_key_exists($key, $options)) {
+                throw new SentinelConfigurationException(
+                    "{$key} must not be set in {$place}: it would replace the master the sentinels name."
+                );
+            }
+        }
     }
 
     /**

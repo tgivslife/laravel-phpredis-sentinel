@@ -289,6 +289,49 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         ];
     }
 
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $options
+     */
+    #[DataProvider('addressesInOptions')]
+    public function test_a_host_or_port_in_options_is_refused_before_anything_is_contacted(array $settings, array $options, string $message): void
+    {
+        // The options are merged over the discovered address, so the client would open against another server.
+        try {
+            $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+                ->connect($this->config('s1:26379', $settings), $options);
+
+            $this->fail('Expected the address in the options to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            $this->assertSame($message, $exception->getMessage());
+            $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
+            $this->assertSame([], $this->clientHosts, 'no client is built');
+        }
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, array<string, mixed>, string}>
+     */
+    public static function addressesInOptions(): array
+    {
+        return [
+            "port in the connection's options" => [['options' => ['port' => 6482]], [], "port must not be set in the connection's options: it would replace the master the sentinels name."],
+            "host in the connection's options" => [['options' => ['host' => '10.0.0.7']], [], "host must not be set in the connection's options: it would replace the master the sentinels name."],
+            'port in the global options' => [[], ['port' => 6482], 'port must not be set in the global Redis options: it would replace the master the sentinels name.'],
+            'host in the global options' => [[], ['host' => '10.0.0.7'], 'host must not be set in the global Redis options: it would replace the master the sentinels name.'],
+            'a null host still replaces it' => [['options' => ['host' => null]], [], "host must not be set in the connection's options: it would replace the master the sentinels name."],
+        ];
+    }
+
+    public function test_a_host_and_port_on_the_connection_itself_are_replaced_by_the_discovered_master(): void
+    {
+        // Laravel's stock connection block carries both; only the options are merged over the discovered address.
+        $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']])
+            ->connect($this->config('s1:26379', ['host' => '127.0.0.1', 'port' => '6379']), ['cluster' => 'redis', 'prefix' => 'app:']);
+
+        $this->assertSame(['10.0.0.9:6380'], $this->clientHosts);
+    }
+
     public function test_a_sentinel_timeout_is_refused_at_connect_even_when_the_master_is_cached(): void
     {
         // It is not part of the cache key, and a cache hit asks no sentinel: checked only in a probe, this connection
