@@ -38,6 +38,11 @@ final class Servers
      */
     private const array SERVICES = ['redis-1', 'redis-2', 'redis-3', 'sentinel-1', 'sentinel-2', 'sentinel-3'];
 
+    /**
+     * The data nodes' services, by port.
+     */
+    private const array NODE_SERVICES = [6390 => 'redis-1', 6391 => 'redis-2', 6392 => 'redis-3'];
+
     private const float TIMEOUT = 0.5;
 
     /**
@@ -287,14 +292,32 @@ final class Servers
     {
         // Naming the six is not enough: Compose recreates a dependency whose configuration hash differs, as it can
         // between the Compose that created `network` and the one in the test container. --no-deps leaves it alone.
-        $process = new Process([
-            'docker', 'compose', '--file', dirname(__DIR__, 2).'/docker/compose.yaml',
-            'up', '--detach', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '60', ...self::SERVICES,
-        ]);
-        $process->setTimeout(120)->run();
+        self::compose('Resetting the servers', 120, 'up', '--detach', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '60', ...self::SERVICES);
+    }
+
+    /**
+     * Kill the data node on the given port, as a crash would (SIGKILL): its clients' sockets close and its port refuses
+     * connections. Its container stays stopped until the next reset.
+     *
+     * @throws RuntimeException When Docker fails.
+     */
+    public static function kill(int $port): void
+    {
+        self::compose("Killing the node on {$port}", 30, 'kill', self::NODE_SERVICES[$port]);
+    }
+
+    /**
+     * Run docker compose on the servers' file.
+     *
+     * @throws RuntimeException When it fails or takes longer than the given seconds.
+     */
+    private static function compose(string $what, int $seconds, string ...$arguments): void
+    {
+        $process = new Process(['docker', 'compose', '--file', dirname(__DIR__, 2).'/docker/compose.yaml', ...$arguments]);
+        $process->setTimeout($seconds)->run();
 
         if (! $process->isSuccessful()) {
-            throw new RuntimeException('Resetting the servers failed: '.trim($process->getErrorOutput() ?: $process->getOutput()));
+            throw new RuntimeException("{$what} failed: ".trim($process->getErrorOutput() ?: $process->getOutput()));
         }
     }
 }
