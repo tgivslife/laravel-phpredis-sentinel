@@ -59,6 +59,7 @@
         "test:feature": "@php vendor/bin/phpunit --testsuite=Feature",
         "servers:reset": "docker compose --file docker/compose.yaml up --detach --force-recreate --remove-orphans --wait --wait-timeout 60",
         "servers:stop": "docker compose --file docker/compose.yaml down --remove-orphans",
+        "test:linux": "docker compose --file docker/compose.yaml run --rm --build php vendor/bin/phpunit",
         "test": [
             "@composer validate --strict",
             "@lint:check",

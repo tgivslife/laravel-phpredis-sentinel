@@ -176,7 +176,7 @@ jobs:
         run: vendor/bin/phpunit
 
   servers:
-    name: Redis and Sentinel servers
+    name: Servers and test container
     runs-on: ubuntu-latest
 
     steps:
@@ -209,6 +209,12 @@ jobs:
           echo "after the failover: $(master)"
           composer servers:reset
           expect 'after the reset'
+
+      - name: Install dependencies in the test container
+        run: docker compose --file docker/compose.yaml run --rm --build php composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Unit and Feature suites in the test container
+        run: composer test:linux
 
       - name: Server logs
         if: failure()
