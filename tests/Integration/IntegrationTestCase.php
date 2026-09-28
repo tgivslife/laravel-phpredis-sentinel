@@ -7,8 +7,10 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 use Closure;
 use Illuminate\Redis\RedisManager;
 use Psr\Log\LoggerInterface;
+use ReflectionProperty;
 use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
+use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Child;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\RecordingLogger;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
@@ -45,6 +47,10 @@ abstract class IntegrationTestCase extends TestCase
         }
 
         $this->ensureCanonicalServers();
+
+        // The connector caches each service's master for the process. After a test that failed over, the reset makes
+        // the cached node a replica again, and a cache hit runs no role check.
+        (new ReflectionProperty(PhpRedisSentinelConnector::class, 'resolvedMasters'))->setValue(null, []);
 
         $this->logger = new RecordingLogger;
         ($this->app ?? $this->fail('The application is not booted.'))->instance(LoggerInterface::class, $this->logger);

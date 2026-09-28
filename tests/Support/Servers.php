@@ -225,6 +225,20 @@ final class Servers
     }
 
     /**
+     * The role the data node on the given port reports for itself: `master`, `slave`, or `unreachable`.
+     */
+    public static function role(int $port): string
+    {
+        try {
+            $replication = self::node($port)->info('replication');
+        } catch (Throwable) {
+            return 'unreachable';
+        }
+
+        return is_array($replication) ? (string) $replication['role'] : 'unreachable';
+    }
+
+    /**
      * How many clients the data node on the given port has subscribed to the channel.
      */
     public static function subscribers(int $port, string $channel): int
