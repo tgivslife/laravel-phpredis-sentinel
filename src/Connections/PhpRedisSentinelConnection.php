@@ -23,6 +23,7 @@ use Throwable;
  * Here each method that talks to the client runs in the retry policy's loop, and a retry rediscovers the master first.
  * The rest (`__call`, `eval`, `flushdb`, …) already goes through command(), and wrapping it again would nest two loops.
  * A blocking pop waits out its own timeout (without one, in slices of the read timeout) instead of failing at the read timeout.
+ * A failover-class error reply that phpredis leaves behind an empty reply, such as READONLY, is retried too.
  *
  * A retry may repeat work: a write whose reply was lost, a whole pipeline, or the keys a scan already returned.
  *
@@ -463,7 +464,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * Run a blocking pop that has no timeout as finite waits, one slice each, until a slice is not empty.
      *
      * Lifting the read timeout instead would leave a hung master unnoticed. Each slice is a pop of its own, so it
-     * recovers under a deadline of its own. An error reply is `false` too, so an empty reply loops only without one.
+     * recovers under a deadline of its own, a failover-class error reply included (pop() raises it). Any other error
+     * reply is `false` too, so an empty reply loops only without one.
      *
      * @param  array<array-key, mixed>  $parameters
      */
@@ -481,15 +483,17 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * Run one blocking pop, raising the demotion an empty reply can hide.
+     * Run one blocking pop, raising a failover-class error reply an empty reply can hide.
      *
-     * A master demoted by a plain REPLICAOF (Sentinel drops the clients instead) answers `UNBLOCKED … instance state changed`.
-     * phpredis throws it for brpoplpush and blmove; the other six return an empty reply, the text only in getLastError().
-     * That text outlives later commands, so it is cleared first.
+     * phpredis throws error replies for brpoplpush and blmove; the other six return an empty reply, the text only in
+     * getLastError(). Among them: READONLY from a node that is no longer master (a stale cached address, or phpredis's
+     * own reconnect after the demotion), and `UNBLOCKED … instance state changed` from a master demoted by a plain
+     * REPLICAOF. Those the retry policy classifies as failover-class are raised, so they are retried; any other, such
+     * as WRONGTYPE, stays an empty reply, as in Laravel. The text outlives later commands, so it is cleared first.
      *
      * @param  array<array-key, mixed>  $parameters
      *
-     * @throws RedisException When the master was demoted during the wait.
+     * @throws RedisException When the pop got a failover-class error reply.
      */
     private function pop(string $method, array $parameters): mixed
     {
@@ -500,8 +504,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
         if (self::isEmptyReply($result)) {
             $error = $this->client->getLastError();
 
-            if ($error !== null && str_contains($error, 'instance state changed')) {
-                throw new RedisException($error);
+            if ($error !== null && $this->retryPolicy->isRetryable($exception = new RedisException($error))) {
+                throw $exception;
             }
         }
 

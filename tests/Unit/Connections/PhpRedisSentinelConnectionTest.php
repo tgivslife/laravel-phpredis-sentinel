@@ -1021,6 +1021,48 @@ final class PhpRedisSentinelConnectionTest extends TestCase
     }
 
     /**
+     * @return array<string, array{string}>
+     */
+    public static function failoverErrorReplies(): array
+    {
+        return [
+            'READONLY, from a node that is no longer master' => ["READONLY You can't write against a read only replica."],
+            'LOADING, from a node loading its dataset' => ['LOADING Redis is loading the dataset in memory'],
+        ];
+    }
+
+    /**
+     * phpredis returns an error reply to six of the pops as an empty reply, the text only in getLastError(). One the
+     * retry policy classifies as failover-class is retried after a rediscovery, not returned as an empty wait.
+     * READONLY was measured (phpredis 6.3.0, Redis 7.4, a pop on a replica); LOADING is classified the same way.
+     */
+    #[DataProvider('failoverErrorReplies')]
+    public function test_a_failover_class_error_reply_to_a_pop_is_retried(string $error): void
+    {
+        $client = $this->blockingClient([['error' => $error, 'return' => false], ['return' => ['q', 'job']]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 5));
+        $this->assertSame([true], $refreshes, 'rediscover and pop again');
+        $this->assertCount(1, $this->logger->warnings());
+    }
+
+    /**
+     * Any other error reply stays what Laravel's own connection returns for it: an empty reply, so `null` from blpop().
+     */
+    public function test_an_error_reply_that_is_not_failover_class_stays_an_empty_reply(): void
+    {
+        $client = $this->blockingClient([['error' => 'WRONGTYPE Operation against a key holding the wrong kind of value', 'return' => false]]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertNull($connection->blpop(['q'], 5));
+        $this->assertSame([], $refreshes);
+        $this->assertSame([], $this->logger->warnings());
+    }
+
+    /**
      * The demotion Sentinel makes: when it reconfigures the old master it kills that master's clients, so a pop
      * waiting there gets a read error (measured: about 11 s after SENTINEL FAILOVER), not UNBLOCKED. The pop is
      * retried after a rediscovery, again with its whole wait plus headroom: the time already waited is not held
@@ -1300,6 +1342,21 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
         $this->assertFalse($connection->brpoplpush('src', 'dst', 0));
         $this->assertCount(1, $client->calls);
+    }
+
+    public function test_a_failover_class_error_reply_to_a_slice_is_retried_instead_of_ending_the_pop(): void
+    {
+        // A slice sent just after the demotion's kill reaches the demoted node through phpredis's own reconnect.
+        $client = $this->blockingClient([
+            ['error' => "READONLY You can't write against a read only replica.", 'return' => false],
+            ['return' => ['q', 'job']],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 0));
+        $this->assertSame([true], $refreshes);
+        $this->assertCount(2, $client->calls);
     }
 
     /**
