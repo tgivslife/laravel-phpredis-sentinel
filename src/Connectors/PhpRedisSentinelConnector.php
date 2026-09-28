@@ -89,7 +89,8 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
     /**
      * Clients come from SentinelClientFactory::make() and Laravel's createClient() unless a test passes its own.
      *
-     * @param  LoggerInterface  $logger  Receives the retry and rediscovery warnings.
+     * @param  LoggerInterface  $logger  Receives the retry warnings, a failed rediscovery named in the next one,
+     *                                   and the scan-restart warning.
      * @param  (Closure(string, int, array<string, mixed>): RedisSentinel)|null  $sentinels  One sentinel's client.
      * @param  (Closure(array<array-key, mixed>): Redis)|null  $clients  A data-node client.
      * @param  MonotonicClock  $clock  Measures and paces the retry budget.
@@ -213,8 +214,11 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             function (?RecoveryDeadline $deadline) use ($connector, &$refresh): Redis {
                 return $connector($refresh, $deadline);
             },
-            function () use (&$refresh): void {
+            // The rediscovery happens in the next attempt, whose own failure says why it failed.
+            function () use (&$refresh): ?string {
                 $refresh = true;
+
+                return null;
             },
             'connect',
         );

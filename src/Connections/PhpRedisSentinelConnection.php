@@ -10,6 +10,7 @@ use Illuminate\Redis\Connections\PhpRedisConnection;
 use Psr\Log\LoggerInterface;
 use Redis;
 use RedisException;
+use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Recovery\RecoveryDeadline;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
@@ -79,7 +80,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * @param  (callable(bool=, ?RecoveryDeadline=): Redis)|null  $connector  Builds a client.
      * @param  array<string, mixed>  $config  The connection configuration, discovery keys already stripped.
      * @param  SentinelRetryPolicy  $retryPolicy  The failover budget shared with the connector.
-     * @param  LoggerInterface  $logger  Receives a warning when a rediscovery fails.
+     * @param  LoggerInterface  $logger  Receives the warning when a scan restarts from the start cursor.
      */
     public function __construct(
         $client,
@@ -303,17 +304,19 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
         try {
             return ($policy ?? $this->retryPolicy)->run(
                 function (?RecoveryDeadline $deadline) use ($callback, $wait, &$failedOn) {
-                    $this->refreshStaleClient($deadline);
+                    $unreachable = $this->refreshStaleClient($deadline);
 
                     $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
 
                     // Not retryable, so the loop lets it through: the budget was spent before the command ran. A pop
                     // whose whole wait no longer fits counts as spent too: even an empty wait would end in an error.
+                    // A rebuild that found no sentinel answering is the cause, and names the hosts.
                     if ($deadline?->spent() || ($readTimeout !== null && $readTimeout <= $wait)) {
                         throw new SentinelFailoverException(sprintf(
-                            'Redis sentinel connection [%s] gave up: the recovery deadline was spent rebuilding the client',
+                            'Redis sentinel connection [%s] gave up: the recovery deadline was spent rebuilding the client%s',
                             $this->getName() ?? 'unknown',
-                        ));
+                            $unreachable === null ? '' : ': '.$unreachable->getMessage(),
+                        ), 0, $unreachable);
                     }
 
                     $client = $this->client;
@@ -379,44 +382,75 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * Rebuild a client that an exhausted budget left for dead, once; the loop owns everything after that.
+     * Rebuild a client that an exhausted budget left for dead before the attempt uses it; the loop owns the rest.
      *
-     * Runs inside the retry loop, so a rediscovery that fails here becomes an ordinary retryable attempt.
+     * A rebuild is a connect, and mostly fails like one: a failover-class failure is the attempt's failure, retried
+     * with its own message in the warning and nothing sent to the dead client, and any other is let through (a
+     * WRONGPASS names a configuration error). The exception is no sentinel answering, which says nothing about the
+     * data node: the old client gets the attempt, as it would between retries, and is unflagged first, so a working
+     * one is not rebuilt again before every later operation. If it fails, the loop carries on, and a budget it runs out
+     * flags it again. Returns that no-sentinel exception, the cause should the rebuild have spent the deadline.
      */
-    private function refreshStaleClient(?RecoveryDeadline $deadline): void
+    private function refreshStaleClient(?RecoveryDeadline $deadline): ?SentinelDiscoveryException
     {
         if (! $this->clientIsStale) {
-            return;
+            return null;
         }
 
-        $this->clientIsStale = false;
-
-        $this->refreshClient($deadline);
-    }
-
-    /**
-     * Replace the client with one for the freshly discovered master, its waits clamped to the deadline.
-     *
-     * A failed rediscovery keeps the old client, which may still serve reads. The old client is never closed
-     * explicitly: its socket may be a persistent one another connection shares, and dropping it is enough.
-     */
-    private function refreshClient(?RecoveryDeadline $deadline = null): void
-    {
         if ($this->rediscover === null) {
-            return;
+            $this->clientIsStale = false;
+
+            return null;
         }
 
         try {
-            $this->client = ($this->rediscover)(true, $deadline);
-        } catch (Throwable $exception) {
-            $this->logger->warning(sprintf(
-                'Redis sentinel connection [%s]: master rediscovery failed, keeping the previous client for the next attempt: %s',
-                $this->getName() ?? 'unknown',
-                $exception->getMessage(),
-            ));
+            $this->replaceClient(($this->rediscover)(true, $deadline));
+        } catch (SentinelDiscoveryException $exception) {
+            if ($exception->anySentinelAnswered) {
+                throw $exception;
+            }
 
-            return;
+            $this->clientIsStale = false;
+
+            return $exception;
         }
+
+        return null;
+    }
+
+    /**
+     * Replace the client with one for the freshly discovered master, its waits clamped to the deadline; returns why
+     * the rediscovery failed, or null. The retry loop reports it in the next attempt's warning.
+     *
+     * A failed rediscovery keeps the old client, which may still serve reads.
+     */
+    private function refreshClient(?RecoveryDeadline $deadline = null): ?string
+    {
+        if ($this->rediscover === null) {
+            return null;
+        }
+
+        try {
+            $this->replaceClient(($this->rediscover)(true, $deadline));
+        } catch (Throwable $exception) {
+            return $exception->getMessage();
+        }
+
+        return null;
+    }
+
+    /**
+     * Use a freshly built client from now on.
+     *
+     * The old client is never closed explicitly: its socket may be a persistent one another connection shares, and
+     * dropping it is enough.
+     *
+     * @param  Redis  $client  Untyped, as Laravel's `$client` property is.
+     */
+    private function replaceClient($client): void
+    {
+        $this->client = $client;
+        $this->clientIsStale = false;
 
         if ($this->unpackedOptions !== null) {
             $this->unpack();
@@ -485,11 +519,12 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * Run one blocking pop, raising a failover-class error reply an empty reply can hide.
      *
-     * phpredis throws error replies for brpoplpush and blmove; the other six return an empty reply, the text only in
-     * getLastError(). Among them: READONLY from a node that is no longer master (a stale cached address, or phpredis's
-     * own reconnect after the demotion), and `UNBLOCKED … instance state changed` from a master demoted by a plain
-     * REPLICAOF. Those the retry policy classifies as failover-class are raised, so they are retried; any other, such
-     * as WRONGTYPE, stays an empty reply, as in Laravel. The text outlives later commands, so it is cleared first.
+     * phpredis throws some error replies (READONLY, UNBLOCKED) for brpoplpush and blmove, but returns the rest as
+     * `false`, and for the other six pops returns them all as an empty reply, the text only in getLastError(). Among
+     * them: READONLY from a node that is no longer master, such as one reached through a stale cached address, and
+     * `UNBLOCKED … instance state changed` from a master demoted by a plain REPLICAOF. Those the retry policy
+     * classifies as failover-class are raised, so they are retried; any other, such as WRONGTYPE, stays an empty reply,
+     * as in Laravel. The text outlives later commands, so it is cleared first.
      *
      * @param  array<array-key, mixed>  $parameters
      *

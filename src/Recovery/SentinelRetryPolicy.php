@@ -131,10 +131,14 @@ final class SentinelRetryPolicy
      * that spends it ends the loop. An operation that waits by design (a blocking pop) passes its expected wait:
      * each attempt's deadline moves later by it, and what an attempt spent, up to that wait, is not recovery time.
      *
+     * A rediscovery that fails is reported in the next attempt's warning, or in the give-up message, rather than on a
+     * line of its own: one warning per retry.
+     *
      * @template TResult
      *
      * @param  callable(?RecoveryDeadline): TResult  $operation  The client operation.
-     * @param  callable(?RecoveryDeadline): void  $onRetry  Runs between attempts; forced rediscovery lives here.
+     * @param  callable(?RecoveryDeadline): ?string  $onRetry  Runs between attempts; forced rediscovery lives here.
+     *                                                         Returns why the rediscovery failed, or null.
      * @param  string  $context  Names the caller in the log lines and the give-up message.
      * @param  int<0, max>  $expectedWaitMs  How long each attempt is expected to wait, in milliseconds.
      * @return TResult The first successful result.
@@ -147,6 +151,7 @@ final class SentinelRetryPolicy
         $attempts = 0;
         $startedAt = $this->clock->now();
         $deadline = $this->deadlineFrom($startedAt);
+        $rediscoveryFailure = null;
 
         while (true) {
             $attemptStartedAt = $this->clock->now();
@@ -165,23 +170,25 @@ final class SentinelRetryPolicy
                 if ($this->attemptDidWork($attemptStartedAt)) {
                     $attempts = 0;
                     $startedAt = $this->clock->now();
+                    $rediscoveryFailure = null;
                 }
 
                 $elapsedMs = $this->elapsedMs($startedAt);
 
                 if (RetrySuppression::active() || $attempts >= $this->attempts || $this->deadlineWouldPass($deadline)) {
-                    throw $this->exhausted($context, $attempts, $elapsedMs, $exception);
+                    throw $this->exhausted($context, $attempts, $elapsedMs, $exception, $rediscoveryFailure);
                 }
 
                 $attempts++;
 
                 $this->logger->warning(sprintf(
-                    'Redis sentinel %s: retryable failure (attempt %d/%d, %dms elapsed), rediscovering master: %s',
+                    'Redis sentinel %s: retryable failure (attempt %d/%d, %dms elapsed), rediscovering master: %s%s',
                     $context,
                     $attempts,
                     $this->attempts,
                     $elapsedMs,
                     $exception->getMessage(),
+                    self::rediscoveryClause($rediscoveryFailure),
                 ));
 
                 if ($this->delayMs > 0) {
@@ -190,13 +197,13 @@ final class SentinelRetryPolicy
 
                 // A sleep only promises a minimum: one that ran past the deadline starts no rediscovery.
                 if ($deadline?->spent()) {
-                    throw $this->exhausted($context, $attempts, $this->elapsedMs($startedAt), $exception);
+                    throw $this->exhausted($context, $attempts, $this->elapsedMs($startedAt), $exception, $rediscoveryFailure);
                 }
 
-                $onRetry($deadline);
+                $rediscoveryFailure = $onRetry($deadline);
 
                 if ($deadline?->spent()) {
-                    throw $this->exhausted($context, $attempts, $this->elapsedMs($startedAt), $exception);
+                    throw $this->exhausted($context, $attempts, $this->elapsedMs($startedAt), $exception, $rediscoveryFailure);
                 }
             }
         }
@@ -234,16 +241,26 @@ final class SentinelRetryPolicy
             : null;
     }
 
-    private function exhausted(string $context, int $attempts, int $elapsedMs, Throwable $exception): SentinelFailoverException
+    private function exhausted(string $context, int $attempts, int $elapsedMs, Throwable $exception, ?string $rediscoveryFailure): SentinelFailoverException
     {
         return new SentinelFailoverException(sprintf(
-            'Redis sentinel %s gave up after %d %s and %dms: %s',
+            'Redis sentinel %s gave up after %d %s and %dms: %s%s',
             $context,
             $attempts,
             $attempts === 1 ? 'retry' : 'retries',
             $elapsedMs,
             $exception->getMessage(),
+            self::rediscoveryClause($rediscoveryFailure),
         ), 0, $exception);
+    }
+
+    /**
+     * The suffix naming the last rediscovery's failure, after the attempt's own error so the message keeps its prefix;
+     * empty on the first attempt and after a rediscovery that succeeded.
+     */
+    private static function rediscoveryClause(?string $failure): string
+    {
+        return $failure === null ? '' : "; last rediscovery failed: {$failure}";
     }
 
     /**

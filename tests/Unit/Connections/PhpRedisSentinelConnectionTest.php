@@ -8,6 +8,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Redis;
 use RedisException;
+use ReflectionProperty;
 use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelDiscoveryException;
@@ -15,6 +16,7 @@ use Tgi\LaravelPhpRedisSentinel\Exceptions\SentinelFailoverException;
 use Tgi\LaravelPhpRedisSentinel\Recovery\SentinelRetryPolicy;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\FakeClock;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\RecordingLogger;
+use Throwable;
 
 /**
  * The connection's retry loop against scripted clients, driven through its public methods.
@@ -759,7 +761,7 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             if ($rediscoveryFails) {
                 $this->clock->advance(40);
 
-                throw new RedisException('No sentinel answered');
+                throw new RedisException('Connection refused');
             }
 
             return $healthy;
@@ -862,7 +864,209 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         $this->assertSame('PONG', $connection->command('ping'));
         $this->assertSame(1, $rebuilds);
         $this->assertSame($client, $connection->client(), 'the original client must survive a failed rebuild');
-        $this->assertStringContainsString('master rediscovery failed', $this->logger->warnings()[1] ?? '');
+        $this->assertCount(1, $this->logger->warnings(), 'the failed rediscovery has no line of its own');
+    }
+
+    public function test_a_failed_rediscovery_is_reported_in_the_next_attempts_warning(): void
+    {
+        $client = $this->flakyClient(2, 'Connection lost');
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$rebuilds, $client): object {
+            if (++$rebuilds === 1) {
+                throw new SentinelDiscoveryException('no master yet', anySentinelAnswered: true);
+            }
+
+            return $client;
+        };
+
+        $connection = new PhpRedisSentinelConnection($client, $connector, [], $this->policy(), $this->logger);
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame([
+            'Redis sentinel connection [unknown]: retryable failure (attempt 1/3, 0ms elapsed), rediscovering master: Connection lost',
+            'Redis sentinel connection [unknown]: retryable failure (attempt 2/3, 0ms elapsed), rediscovering master: Connection lost; last rediscovery failed: no master yet',
+        ], $this->logger->warnings());
+    }
+
+    /**
+     * A stale client's rebuild is a connect, and fails like one: a failover-class failure is the attempt's failure,
+     * retried with its own message in the warning, and nothing is sent to the dead client.
+     */
+    public function test_a_stale_rebuild_that_fails_is_the_attempts_failure_and_is_retried(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection refused');
+        $healthy = $this->flakyClient(0, 'unused');
+        $handOut = [];
+
+        $connector = function (bool $refresh = false) use (&$handOut, $dead): object {
+            $next = array_shift($handOut) ?? $dead;
+
+            return $next instanceof Throwable ? throw $next : $next;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $handOut = [new RedisException('Connection refused by the master the sentinels still name'), $healthy];
+        $deadPings = $dead->pings;
+        $warnings = count($this->logger->warnings());
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame($deadPings, $dead->pings, 'nothing sent to the dead client');
+        $this->assertStringEndsWith(
+            'rediscovering master: Connection refused by the master the sentinels still name',
+            $this->logger->warnings()[$warnings] ?? '',
+        );
+    }
+
+    /**
+     * No sentinel answering says nothing about the data node: the stale client gets the attempt, as it would between
+     * retries, unflagged first, so a working one is not rebuilt before every later operation.
+     */
+    public function test_with_no_sentinel_answering_a_stale_client_that_works_is_used_and_unflagged(): void
+    {
+        // Fails the exhausted operation's two pings, then works.
+        $client = $this->flakyClient(2, 'Connection lost');
+        $rebuilds = 0;
+
+        $connector = function (bool $refresh = false) use (&$rebuilds): never {
+            $rebuilds++;
+
+            throw new SentinelDiscoveryException('No sentinel answered: s1:26379, s2:26379', anySentinelAnswered: false);
+        };
+
+        $connection = new PhpRedisSentinelConnection($client, $connector, [], $this->policy(1), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $this->assertTrue($this->isStale($connection));
+        $rebuildsBefore = $rebuilds;
+
+        $this->assertSame('PONG', $connection->command('ping'), 'the old client served it');
+        $this->assertSame($rebuildsBefore + 1, $rebuilds, 'one rebuild tried');
+        $this->assertFalse($this->isStale($connection));
+
+        $this->assertSame('PONG', $connection->command('ping'));
+        $this->assertSame($rebuildsBefore + 1, $rebuilds, 'no sentinel round before the next operation');
+    }
+
+    public function test_with_no_sentinel_answering_a_stale_client_that_is_dead_gives_up_naming_the_sentinels_and_is_flagged_again(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection lost');
+
+        $connector = function (bool $refresh = false): never {
+            throw new SentinelDiscoveryException('No sentinel answered: s1:26379, s2:26379', anySentinelAnswered: false);
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1), $this->logger);
+
+        foreach (['exhausts: flagged stale', 'the old client is tried, fails, and the budget runs out'] as $step) {
+            try {
+                $connection->command('ping');
+                $this->fail("Expected the budget to exhaust ({$step}).");
+            } catch (SentinelFailoverException $exception) {
+                $this->assertStringEndsWith('Connection lost; last rediscovery failed: No sentinel answered: s1:26379, s2:26379', $exception->getMessage());
+            }
+        }
+
+        $this->assertTrue($this->isStale($connection));
+    }
+
+    /**
+     * Sentinels that time out rather than refuse can spend the deadline in the rebuild: the give-up then carries the
+     * no-sentinel exception, the one that says what is wrong, and the client is flagged again.
+     */
+    public function test_a_no_sentinel_rebuild_that_spends_the_deadline_gives_up_with_that_exception_as_the_cause(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection lost');
+        $sentinelsDown = new SentinelDiscoveryException('No sentinel answered: s1:26379, s2:26379', anySentinelAnswered: false);
+
+        $connector = function (bool $refresh = false) use ($sentinelsDown): never {
+            $this->clock->advance(40);
+
+            throw $sentinelsDown;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1, 0, 30), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $deadPings = $dead->pings;
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the rebuild to spend the deadline.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame($sentinelsDown, $exception->getPrevious());
+            $this->assertStringEndsWith('rebuilding the client: No sentinel answered: s1:26379, s2:26379', $exception->getMessage());
+        }
+
+        $this->assertSame($deadPings, $dead->pings, 'the command did not run');
+        $this->assertTrue($this->isStale($connection));
+    }
+
+    /**
+     * Any other failure that is not failover-class names something wrong with the rebuilt client, such as its
+     * credentials, and is let through as connect() would let it; the old client is not tried behind it.
+     */
+    public function test_a_stale_rebuild_that_fails_on_a_configuration_error_is_let_through_without_trying_the_old_client(): void
+    {
+        $dead = $this->flakyClient(PHP_INT_MAX, 'Connection lost');
+        $wrongPassword = new RedisException('WRONGPASS invalid username-password pair or user is disabled.');
+        $handOut = [$dead];
+
+        $connector = function (bool $refresh = false) use (&$handOut): object {
+            $next = array_shift($handOut) ?? throw new RuntimeException('no more clients');
+
+            return $next instanceof Throwable ? throw $next : $next;
+        };
+
+        $connection = new PhpRedisSentinelConnection($dead, $connector, [], $this->policy(1), $this->logger);
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // Flagged stale on the way out.
+        }
+
+        $handOut = [$wrongPassword];
+        $deadPings = $dead->pings;
+
+        try {
+            $connection->command('ping');
+            $this->fail('Expected the failed rebuild to end the operation.');
+        } catch (RedisException $exception) {
+            $this->assertSame($wrongPassword, $exception, 'as connect() would let it through');
+        }
+
+        $this->assertSame($deadPings, $dead->pings, 'the old client was not tried');
+        $this->assertTrue($this->isStale($connection));
+    }
+
+    /**
+     * Whether the connection will rebuild its client before the next operation.
+     */
+    private function isStale(PhpRedisSentinelConnection $connection): bool
+    {
+        return (bool) (new ReflectionProperty($connection, 'clientIsStale'))->getValue($connection);
     }
 
     public function test_a_failed_rediscovery_is_survivable_within_the_budget(): void
@@ -1346,7 +1550,7 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
     public function test_a_failover_class_error_reply_to_a_slice_is_retried_instead_of_ending_the_pop(): void
     {
-        // A slice sent just after the demotion's kill reaches the demoted node through phpredis's own reconnect.
+        // A slice on a node that is no longer master, such as one reached through a stale cached address.
         $client = $this->blockingClient([
             ['error' => "READONLY You can't write against a read only replica.", 'return' => false],
             ['return' => ['q', 'job']],

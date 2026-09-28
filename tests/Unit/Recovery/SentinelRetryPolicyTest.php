@@ -67,6 +67,82 @@ final class SentinelRetryPolicyTest extends TestCase
         $this->assertCount(2, $this->logger->warnings(), 'every retry logs a warning');
     }
 
+    /**
+     * One warning per retry: a rediscovery that failed is named at the end of the next one, after the attempt's own
+     * error, and one that succeeded leaves the next without it.
+     */
+    public function test_a_failed_rediscovery_is_named_in_the_next_warning_and_a_successful_one_clears_it(): void
+    {
+        $calls = 0;
+        $rediscoveries = ['Connection refused', null, 'no master yet'];
+
+        $this->policy()->run(
+            function () use (&$calls): string {
+                if (++$calls <= 3) {
+                    throw new RedisException('Redis server 10.0.0.1:6380 went away');
+                }
+
+                return 'PONG';
+            },
+            function () use (&$rediscoveries): ?string {
+                return array_shift($rediscoveries);
+            },
+            'test',
+        );
+
+        $this->assertSame([
+            'Redis sentinel test: retryable failure (attempt 1/3, 0ms elapsed), rediscovering master: Redis server 10.0.0.1:6380 went away',
+            'Redis sentinel test: retryable failure (attempt 2/3, 0ms elapsed), rediscovering master: Redis server 10.0.0.1:6380 went away; last rediscovery failed: Connection refused',
+            'Redis sentinel test: retryable failure (attempt 3/3, 0ms elapsed), rediscovering master: Redis server 10.0.0.1:6380 went away',
+        ], $this->logger->warnings(), 'the third rediscovery failed too, but the attempt after it succeeded');
+    }
+
+    public function test_a_give_up_names_the_last_rediscovery_failure(): void
+    {
+        try {
+            $this->policy(attempts: 1)->run(
+                fn () => throw new RedisException('Redis server 10.0.0.1:6380 went away'),
+                fn (): string => 'No sentinel answered',
+                'test',
+            );
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException $exception) {
+            $this->assertSame(
+                'Redis sentinel test gave up after 1 retry and 0ms: Redis server 10.0.0.1:6380 went away; last rediscovery failed: No sentinel answered',
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    /**
+     * A blocking attempt long enough to have been working starts a new incident: its warning is an attempt 1 again,
+     * without the previous incident's rediscovery failure.
+     */
+    public function test_a_new_blocking_incident_starts_without_the_previous_rediscovery_failure(): void
+    {
+        $calls = 0;
+
+        try {
+            $this->policy(attempts: 1)->forBlockingOperations()->run(
+                function () use (&$calls): never {
+                    if (++$calls === 2) {
+                        $this->clock->advance(2000);
+                    }
+
+                    throw new RedisException('Redis server 10.0.0.1:6380 went away');
+                },
+                fn (): string => 'Connection refused',
+                'test',
+            );
+            $this->fail('Expected the budget to exhaust.');
+        } catch (SentinelFailoverException) {
+            // The third attempt fails fast, after the second incident's one retry.
+        }
+
+        $this->assertCount(2, $this->logger->warnings());
+        $this->assertStringEndsWith('(attempt 1/1, 0ms elapsed), rediscovering master: Redis server 10.0.0.1:6380 went away', $this->logger->warnings()[1]);
+    }
+
     public function test_it_recognises_every_shape_a_failover_produces(): void
     {
         $policy = $this->policy();

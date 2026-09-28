@@ -14,7 +14,8 @@ use RedisException;
  * A sentinel deployment must not quietly fall outside those guards just because this driver sits underneath.
  *
  * The last failure is attached as `previous`: this type says "we stopped trying", the previous says what went wrong.
- * A budget spent before any attempt failed, such as one spent rebuilding a stale client, has no previous.
+ * A budget spent before any attempt failed, such as one a stale client's rebuild spent, has no previous, unless that
+ * rebuild found no sentinel answering: the SentinelDiscoveryException naming the hosts is then the previous.
  *
  * @api
  */
