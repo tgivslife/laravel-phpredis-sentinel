@@ -178,6 +178,8 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
+    # A test stuck in a wait without a limit (a subscription, a paused server) fails here instead of after 6 hours.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
