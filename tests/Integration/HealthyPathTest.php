@@ -4,12 +4,9 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 
-use Illuminate\Redis\RedisManager;
-use Psr\Log\LoggerInterface;
 use Redis;
 use Symfony\Component\Process\Process;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
-use Tgi\LaravelPhpRedisSentinel\Tests\Support\RecordingLogger;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
 
 /**
@@ -18,21 +15,9 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
  */
 final class HealthyPathTest extends IntegrationTestCase
 {
-    private const string SENTINEL_HOSTS = '127.0.0.1:26390,127.0.0.1:26391,127.0.0.1:26392';
-
-    private RecordingLogger $logger;
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-
-        $this->logger = new RecordingLogger;
-        ($this->app ?? $this->fail('The application is not booted.'))->instance(LoggerInterface::class, $this->logger);
-    }
-
     public function test_the_connection_opens_on_the_master_the_sentinels_name(): void
     {
-        $connection = $this->connection();
+        $connection = $this->sentinelConnection();
 
         $this->assertSame([Servers::HOST, Servers::MASTER], [$connection->client()->getHost(), $connection->client()->getPort()]);
         $this->assertSame('master', $this->role($connection));
@@ -41,7 +26,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_commands_run_on_the_master_with_the_connections_database_name_and_prefix(): void
     {
-        $connection = $this->connection(['database' => 1, 'name' => 'healthy-path'], ['prefix' => 'app:']);
+        $connection = $this->sentinelConnection(['database' => 1, 'name' => 'healthy-path'], ['prefix' => 'app:']);
 
         $this->assertTrue($connection->set('greeting', 'hello'));
         $this->assertSame('hello', $connection->get('greeting'));
@@ -57,7 +42,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_a_pipeline_and_a_transaction_return_every_reply(): void
     {
-        $connection = $this->connection();
+        $connection = $this->sentinelConnection();
 
         $this->assertSame([true, 2, '2'], $connection->pipeline(function (Redis $pipe): void {
             $pipe->set('piped', '1');
@@ -76,7 +61,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_a_scan_returns_every_key(): void
     {
-        $connection = $this->connection();
+        $connection = $this->sentinelConnection();
         $written = array_map(fn (int $index): string => "scanned:{$index}", range(1, 250));
         $connection->mset(array_fill_keys($written, '1'));
         $connection->set('elsewhere', '1');
@@ -102,7 +87,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_an_idle_subscriber_outlives_the_read_timeout_and_gets_it_back(): void
     {
-        $connection = $this->connection(['read_timeout' => 1.0]);
+        $connection = $this->sentinelConnection(['read_timeout' => 1.0]);
 
         // Publishes 1.5 s after the subscription exists: past the read timeout, which the subscription lifts.
         $publisher = $this->inBackground(<<<'PHP'
@@ -129,7 +114,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_a_blocking_pop_waits_past_the_read_timeout_for_an_element(): void
     {
-        $connection = $this->connection(['read_timeout' => 1.0]);
+        $connection = $this->sentinelConnection(['read_timeout' => 1.0]);
         $client = $connection->client()->client('id');
 
         // Pushes 1.5 s after the pop blocks: past the read timeout, within the pop's own.
@@ -156,7 +141,7 @@ final class HealthyPathTest extends IntegrationTestCase
 
     public function test_an_empty_blocking_pop_waits_its_whole_timeout_without_a_retry(): void
     {
-        $connection = $this->connection(['read_timeout' => 1.0]);
+        $connection = $this->sentinelConnection(['read_timeout' => 1.0]);
         $client = $connection->client()->client('id');
 
         $started = hrtime(true);
@@ -168,35 +153,6 @@ final class HealthyPathTest extends IntegrationTestCase
         $this->assertLessThan(3.0, $elapsed, 'within the wait plus the read timeout as headroom');
         $this->assertSame($client, $connection->client()->client('id'));
         $this->assertSame([], $this->logger->warnings());
-    }
-
-    /**
-     * A Sentinel connection opened by Laravel's manager with the package's provider, listing all three sentinels.
-     *
-     * Typed as what it is: the manager returns the base Connection, whose `@mixin \Redis` would resolve scan() to
-     * phpredis's own signature instead of Laravel's.
-     *
-     * @param  array<string, mixed>  $settings  Added to the connection's block.
-     * @param  array<string, mixed>  $options  The global options.
-     */
-    private function connection(array $settings = [], array $options = []): PhpRedisSentinelConnection
-    {
-        $app = $this->app ?? $this->fail('The application is not booted.');
-
-        $app['config']->set('database.redis', [
-            'client' => 'phpredis',
-            'options' => $options,
-            'default' => ['sentinel_hosts' => self::SENTINEL_HOSTS, 'sentinel_service' => Servers::SERVICE] + $settings,
-        ]);
-        $app->forgetInstance('redis');
-
-        $redis = $app->make('redis');
-        $this->assertInstanceOf(RedisManager::class, $redis);
-
-        $connection = $redis->connection('default');
-        $this->assertInstanceOf(PhpRedisSentinelConnection::class, $connection);
-
-        return $connection;
     }
 
     /**

@@ -4,7 +4,13 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 
+use Closure;
+use Illuminate\Redis\RedisManager;
+use Psr\Log\LoggerInterface;
 use RuntimeException;
+use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
+use Tgi\LaravelPhpRedisSentinel\Tests\Support\Child;
+use Tgi\LaravelPhpRedisSentinel\Tests\Support\RecordingLogger;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
 use Tgi\LaravelPhpRedisSentinel\Tests\TestCase;
 
@@ -18,6 +24,16 @@ use Tgi\LaravelPhpRedisSentinel\Tests\TestCase;
  */
 abstract class IntegrationTestCase extends TestCase
 {
+    private const string SENTINEL_HOSTS = '127.0.0.1:26390,127.0.0.1:26391,127.0.0.1:26392';
+
+    /**
+     * The container's logger: the package's warnings, one per retry among them.
+     */
+    protected RecordingLogger $logger;
+
+    /** @var list<Child> */
+    private array $children = [];
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -29,6 +45,57 @@ abstract class IntegrationTestCase extends TestCase
         }
 
         $this->ensureCanonicalServers();
+
+        $this->logger = new RecordingLogger;
+        ($this->app ?? $this->fail('The application is not booted.'))->instance(LoggerInterface::class, $this->logger);
+    }
+
+    protected function tearDown(): void
+    {
+        foreach ($this->children as $child) {
+            $child->kill();
+        }
+
+        parent::tearDown();
+    }
+
+    /**
+     * A Sentinel connection opened by Laravel's manager with the package's provider, listing all three sentinels.
+     *
+     * Typed as what it is: the manager returns the base Connection, whose `@mixin \Redis` would resolve scan() to
+     * phpredis's own signature instead of Laravel's.
+     *
+     * @param  array<string, mixed>  $settings  Added to the connection's block.
+     * @param  array<string, mixed>  $options  The global options.
+     */
+    protected function sentinelConnection(array $settings = [], array $options = []): PhpRedisSentinelConnection
+    {
+        $app = $this->app ?? $this->fail('The application is not booted.');
+
+        $app['config']->set('database.redis', [
+            'client' => 'phpredis',
+            'options' => $options,
+            'default' => ['sentinel_hosts' => self::SENTINEL_HOSTS, 'sentinel_service' => Servers::SERVICE] + $settings,
+        ]);
+        $app->forgetInstance('redis');
+
+        $redis = $app->make('redis');
+        $this->assertInstanceOf(RedisManager::class, $redis);
+
+        $connection = $redis->connection('default');
+        $this->assertInstanceOf(PhpRedisSentinelConnection::class, $connection);
+
+        return $connection;
+    }
+
+    /**
+     * Run part of the test in a forked child, killed when the test ends if it is still running.
+     *
+     * @param  Closure(Closure(string): void): mixed  $body
+     */
+    protected function fork(Closure $body): Child
+    {
+        return $this->children[] = Child::run($body);
     }
 
     /**

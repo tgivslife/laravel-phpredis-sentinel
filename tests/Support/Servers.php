@@ -129,6 +129,142 @@ final class Servers
     }
 
     /**
+     * The port the first answering sentinel names as the master's; 0 when none answers.
+     */
+    public static function namedMaster(): int
+    {
+        foreach (self::SENTINELS as $port) {
+            try {
+                $address = self::sentinel($port)->getMasterAddrByName(self::SERVICE);
+            } catch (Throwable) {
+                continue;
+            }
+
+            if (is_array($address)) {
+                return (int) $address[1];
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Fail over with SENTINEL FAILOVER, and wait until every sentinel names the new master; returns its port.
+     *
+     * The sentinels refuse while a replica is still syncing (NOGOODSLAVE) or a failover is under way (INPROG), so the
+     * request is repeated until one is accepted, or the named master has changed.
+     *
+     * @throws RuntimeException When no failover is accepted, or completed, within 30 seconds.
+     */
+    public static function failover(): int
+    {
+        $old = self::namedMaster();
+
+        // A master already renamed counts as accepted: a request whose reply was lost may have started this failover,
+        // and asking again once it completes would start a second one.
+        self::waitUntil(static function () use ($old): bool {
+            $named = self::namedMaster();
+
+            if ($named !== 0 && $named !== $old) {
+                return true;
+            }
+
+            try {
+                return self::sentinel(self::SENTINELS[0])->failover(self::SERVICE) === true;
+            } catch (Throwable) {
+                return false;
+            }
+        }, 30, 'a sentinel to accept SENTINEL FAILOVER');
+
+        self::waitUntil(static function () use ($old): bool {
+            $named = [];
+
+            foreach (self::SENTINELS as $port) {
+                try {
+                    $address = self::sentinel($port)->getMasterAddrByName(self::SERVICE);
+                } catch (Throwable) {
+                    return false;
+                }
+
+                $named[] = is_array($address) ? (int) $address[1] : 0;
+            }
+
+            return count(array_unique($named)) === 1 && ! in_array($named[0], [0, $old], true);
+        }, 30, "every sentinel to name a master other than {$old}");
+
+        return self::namedMaster();
+    }
+
+    /**
+     * Whether another failover can start: the named master has both replicas online, and every sentinel sees it and
+     * both replicas healthy. Until then SENTINEL FAILOVER may answer NOGOODSLAVE.
+     */
+    public static function readyForFailover(): bool
+    {
+        try {
+            $replication = self::node(self::namedMaster())->info('replication');
+
+            if (! is_array($replication) || $replication['role'] !== 'master' || substr_count(implode(' ', $replication), 'state=online') !== 2) {
+                return false;
+            }
+
+            foreach (self::SENTINELS as $port) {
+                $sentinel = self::sentinel($port);
+                $master = $sentinel->master(self::SERVICE);
+                $replicas = $sentinel->slaves(self::SERVICE);
+
+                if (! is_array($master) || $master['flags'] !== 'master' || ! is_array($replicas) || array_column($replicas, 'flags') !== ['slave', 'slave']) {
+                    return false;
+                }
+            }
+        } catch (Throwable) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * How many clients the data node on the given port has subscribed to the channel.
+     */
+    public static function subscribers(int $port, string $channel): int
+    {
+        $counts = self::node($port)->pubsub('numsub', [$channel]);
+
+        return is_array($counts) ? (int) ($counts[$channel] ?? 0) : 0;
+    }
+
+    /**
+     * How many clients the data node on the given port has blocked in a blocking command.
+     */
+    public static function blockedClients(int $port): int
+    {
+        $clients = self::node($port)->info('clients');
+
+        return is_array($clients) ? (int) $clients['blocked_clients'] : 0;
+    }
+
+    /**
+     * Poll a condition every 50 ms until it holds.
+     *
+     * @param  callable(): bool  $condition
+     *
+     * @throws RuntimeException When it does not hold within the given seconds.
+     */
+    public static function waitUntil(callable $condition, float $seconds, string $what): void
+    {
+        $until = hrtime(true) + (int) ($seconds * 1e9);
+
+        while (! $condition()) {
+            if (hrtime(true) > $until) {
+                throw new RuntimeException(sprintf('Timed out after %.1f s waiting for %s.', $seconds, $what));
+            }
+
+            usleep(50_000);
+        }
+    }
+
+    /**
      * Recreate the six servers, which puts them in the canonical state with no data, and wait until they are healthy.
      *
      * @throws RuntimeException When Docker fails or the servers are not healthy within 60 seconds.
