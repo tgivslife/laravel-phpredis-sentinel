@@ -1,0 +1,117 @@
+# Disposable Redis and Sentinel servers for the integration tests: one master, two replicas and three sentinels
+# (quorum 2). The tests fail these over, stop and pause them, so never point them at an application's servers.
+#
+# Canonical state: redis-1 (6390) master, redis-2 (6391) and redis-3 (6392) its replicas, sentinels on 26390-26392,
+# all on 127.0.0.1 and without data. `composer servers:reset` starts the servers or, by recreating every container,
+# brings them back to that state; `composer servers:stop` removes them.
+#
+# Every server joins the network namespace of the `network` service, which does nothing else: the 127.0.0.1 addresses
+# the sentinels announce are then valid inside the namespace and, through the ports it publishes, on the host. Any
+# server can be stopped or killed without taking the others' network with it.
+
+name: laravel-phpredis-sentinel
+
+x-server: &server
+  image: redis:7.4-alpine
+  network_mode: service:network
+  # Nothing survives a restart: a replica's full sync writes an RDB to /data, which redis-server would load.
+  tmpfs: /data
+
+x-health: &health
+  interval: 5s
+  timeout: 3s
+  retries: 3
+  start_period: 30s
+  start_interval: 1s
+
+# A master, or a replica whose link to its master is up. Role-agnostic, so a failover keeps it true.
+x-node-health: &node-health
+  <<: *health
+  test: [ 'CMD-SHELL', 'redis-cli -p "$$PORT" info replication | grep -Eq "^(role:master|master_link_status:up)"' ]
+
+# Every sentinel sees the other two, the master up and both replicas up: a failover can be authorised and has a
+# replica to promote.
+x-sentinel-health: &sentinel-health
+  <<: *health
+  test:
+    - CMD-SHELL
+    - >-
+      redis-cli -p "$$PORT" sentinel ckquorum mymaster | grep -q "^OK 3 "
+      && redis-cli -p "$$PORT" sentinel master mymaster | grep -A1 -x flags | grep -qx master
+      && test "$$(redis-cli -p "$$PORT" sentinel replicas mymaster | grep -A1 -x flags | grep -cx slave)" -eq 2
+
+# Sentinel rewrites its configuration file, so each one writes a fresh file when it starts, with no mount.
+x-sentinel: &sentinel
+  <<: *server
+  command:
+    - sh
+    - -c
+    - |
+      printf '%s\n' \
+        "port $$PORT" \
+        'sentinel monitor mymaster 127.0.0.1 6390 2' \
+        'sentinel down-after-milliseconds mymaster 5000' \
+        'sentinel failover-timeout mymaster 10000' \
+        'sentinel parallel-syncs mymaster 1' \
+        > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf
+  healthcheck: *sentinel-health
+  depends_on:
+    redis-2:
+      condition: service_healthy
+    redis-3:
+      condition: service_healthy
+
+services:
+  network:
+    image: redis:7.4-alpine
+    command: [ 'sleep', 'infinity' ]
+    init: true
+    ports:
+      - '127.0.0.1:6390-6392:6390-6392'
+      - '127.0.0.1:26390-26392:26390-26392'
+
+  # The data nodes start redis-server as the image's first argument, so its entrypoint adds `--protected-mode no`:
+  # a client coming through a published port does not connect from loopback.
+  redis-1:
+    <<: *server
+    command: [ 'redis-server', '--port', '6390', '--save', '', '--appendonly', 'no' ]
+    environment:
+      PORT: 6390
+    healthcheck: *node-health
+    depends_on:
+      - network
+
+  redis-2:
+    <<: *server
+    command: [ 'redis-server', '--port', '6391', '--save', '', '--appendonly', 'no', '--replicaof', '127.0.0.1', '6390' ]
+    environment:
+      PORT: 6391
+    healthcheck: *node-health
+    depends_on:
+      redis-1:
+        condition: service_healthy
+
+  redis-3:
+    <<: *server
+    command: [ 'redis-server', '--port', '6392', '--save', '', '--appendonly', 'no', '--replicaof', '127.0.0.1', '6390' ]
+    environment:
+      PORT: 6392
+    healthcheck: *node-health
+    depends_on:
+      redis-1:
+        condition: service_healthy
+
+  sentinel-1:
+    <<: *sentinel
+    environment:
+      PORT: 26390
+
+  sentinel-2:
+    <<: *sentinel
+    environment:
+      PORT: 26391
+
+  sentinel-3:
+    <<: *sentinel
+    environment:
+      PORT: 26392

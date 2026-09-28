@@ -57,6 +57,8 @@
         "analyse": "@php vendor/bin/phpstan analyse --memory-limit=-1",
         "test:unit": "@php vendor/bin/phpunit --testsuite=Unit",
         "test:feature": "@php vendor/bin/phpunit --testsuite=Feature",
+        "servers:reset": "docker compose --file docker/compose.yaml up --detach --force-recreate --remove-orphans --wait --wait-timeout 60",
+        "servers:stop": "docker compose --file docker/compose.yaml down --remove-orphans",
         "test": [
             "@composer validate --strict",
             "@lint:check",

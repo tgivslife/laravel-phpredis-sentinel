@@ -8,6 +8,7 @@
 /.gitignore                         export-ignore
 /.editorconfig                      export-ignore
 /.idea                              export-ignore
+/docker                             export-ignore
 /tests                              export-ignore
 /composer-dependency-analyser.php   export-ignore
 /phpstan.neon.dist                  export-ignore
