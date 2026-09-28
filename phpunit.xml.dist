@@ -9,6 +9,8 @@
     failOnWarning="true"
     failOnNotice="true"
     failOnRisky="true"
+    failOnSkipped="true"
+    failOnIncomplete="true"
     failOnEmptyTestSuite="true"
     beStrictAboutOutputDuringTests="true"
     defaultTestSuite="Unit,Feature"
@@ -19,6 +21,9 @@
         </testsuite>
         <testsuite name="Feature">
             <directory suffix="Test.php">tests/Feature</directory>
+        </testsuite>
+        <testsuite name="Integration">
+            <directory suffix="Test.php">tests/Integration</directory>
         </testsuite>
     </testsuites>
     <source>

@@ -59,7 +59,11 @@
         "test:feature": "@php vendor/bin/phpunit --testsuite=Feature",
         "servers:reset": "docker compose --file docker/compose.yaml up --detach --force-recreate --remove-orphans --wait --wait-timeout 60",
         "servers:stop": "docker compose --file docker/compose.yaml down --remove-orphans",
-        "test:linux": "docker compose --file docker/compose.yaml run --rm --build php vendor/bin/phpunit",
+        "test:linux": [
+            "docker compose --file docker/compose.yaml up --detach network @no_additional_args",
+            "docker compose --file docker/compose.yaml run --rm --build --no-deps php vendor/bin/phpunit @additional_args"
+        ],
+        "test:integration": "@test:linux --testsuite=Integration",
         "test": [
             "@composer validate --strict",
             "@lint:check",

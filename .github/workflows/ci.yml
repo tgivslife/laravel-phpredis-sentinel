@@ -175,8 +175,8 @@ jobs:
       - name: Unit and Feature suites
         run: vendor/bin/phpunit
 
-  servers:
-    name: Servers and test container
+  integration:
+    name: Integration
     runs-on: ubuntu-latest
 
     steps:
@@ -185,36 +185,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Start
+      - name: Start the servers
         run: composer servers:reset
-
-      # From the runner through the published ports, where a client outside the servers' namespace reaches them.
-      - name: Reset after a failover
-        shell: bash
-        run: |
-          master() { docker run --rm --network host redis:7.4-alpine redis-cli -p 26390 sentinel get-master-addr-by-name mymaster | paste -sd:; }
-          expect() {
-            if [ "$(master)" != 127.0.0.1:6390 ]; then
-              echo "::error title=Not canonical::$1: the sentinels name $(master), not 127.0.0.1:6390"
-              exit 1
-            fi
-          }
-          expect 'after the start'
-          docker compose --file docker/compose.yaml exec -T sentinel-1 redis-cli -p 26390 sentinel failover mymaster
-          for attempt in $(seq 1 20); do [ "$(master)" != 127.0.0.1:6390 ] && break; sleep 0.5; done
-          if [ "$(master)" = 127.0.0.1:6390 ]; then
-            echo '::error title=No failover::the sentinels still name 127.0.0.1:6390 10 s after SENTINEL FAILOVER'
-            exit 1
-          fi
-          echo "after the failover: $(master)"
-          composer servers:reset
-          expect 'after the reset'
 
       - name: Install dependencies in the test container
         run: docker compose --file docker/compose.yaml run --rm --build php composer update --prefer-dist --no-interaction --no-progress
 
-      - name: Unit and Feature suites in the test container
-        run: composer test:linux
+      - name: Integration suite
+        run: composer test:integration
 
       - name: Server logs
         if: failure()

@@ -118,19 +118,15 @@ services:
 
   # Where the tests run on Linux (`composer test:linux`), with the working tree mounted. It joins the servers'
   # namespace, so the addresses the sentinels announce are valid in it, and drives the servers through the host's
-  # Docker socket, which gives it control of every container on the host, not only these.
+  # Docker socket, which gives it control of every container on the host, not only these. It does not wait for the
+  # servers: the integration tests reset them from whatever state they are in, paused and stopped included.
   php:
     build: php
     profiles: [ 'tests' ]
     network_mode: service:network
     working_dir: /package
+    environment:
+      INTEGRATION_CONTAINER: 1
     volumes:
       - ..:/package
       - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      sentinel-1:
-        condition: service_healthy
-      sentinel-2:
-        condition: service_healthy
-      sentinel-3:
-        condition: service_healthy
