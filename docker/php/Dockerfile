@@ -11,6 +11,10 @@ RUN apt-get update \
     && docker-php-ext-install pcntl \
     && mv "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
 
+# Run by the `certs` service, from this image: a script bind-mounted instead would not be found when Compose runs in
+# this container, since the daemon resolves a bind mount's source on the host.
+COPY make-certs.php /usr/local/bin/make-certs.php
+
 COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
 COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker:29-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose

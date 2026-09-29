@@ -61,6 +61,53 @@ x-sentinel: &sentinel
     redis-3:
       condition: service_healthy
 
+# The TLS servers' checks: the same as above, over TLS, verified against the test CA.
+x-tls-node-health: &tls-node-health
+  <<: *health
+  test:
+    - CMD-SHELL
+    - >-
+      redis-cli --tls --cacert /certs/ca.pem -p "$$PORT" info replication
+      | grep -Eq "^(role:master|master_link_status:up)"
+
+x-tls-sentinel-health: &tls-sentinel-health
+  <<: *health
+  test:
+    - CMD-SHELL
+    - >-
+      redis-cli --tls --cacert /certs/ca.pem -p "$$PORT" sentinel ckquorum mymaster | grep -q "^OK 3 "
+      && redis-cli --tls --cacert /certs/ca.pem -p "$$PORT" sentinel master mymaster | grep -A1 -x flags | grep -qx master
+      && test "$$(redis-cli --tls --cacert /certs/ca.pem -p "$$PORT" sentinel replicas mymaster | grep -A1 -x flags | grep -cx slave)" -eq 1
+
+# A TLS sentinel: TLS to the servers it monitors and to the other sentinels (tls-replication), and to its clients on
+# PORT; plaintext to its clients on PLAIN_PORT as well.
+x-tls-sentinel: &tls-sentinel
+  <<: *server
+  profiles: [ 'tls' ]
+  command:
+    - sh
+    - -c
+    - |
+      printf '%s\n' \
+        "port $$PLAIN_PORT" \
+        "tls-port $$PORT" \
+        'tls-cert-file /certs/server.pem' \
+        'tls-key-file /certs/server-key.pem' \
+        'tls-ca-cert-file /certs/ca.pem' \
+        'tls-auth-clients no' \
+        'tls-replication yes' \
+        'sentinel monitor mymaster 127.0.0.1 6490 2' \
+        'sentinel down-after-milliseconds mymaster 5000' \
+        'sentinel failover-timeout mymaster 10000' \
+        'sentinel parallel-syncs mymaster 1' \
+        > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf
+  volumes:
+    - tls-certs:/certs:ro
+  healthcheck: *tls-sentinel-health
+  depends_on:
+    redis-tls-2:
+      condition: service_healthy
+
 services:
   network:
     image: redis:7.4-alpine
@@ -116,11 +163,77 @@ services:
     environment:
       PORT: 26392
 
+  # --- TLS: a second set of servers, in the `tls` profile, which the TLS tests start ---------------------------------
+  # A master (6490) and its replica (6491), TLS only (`--port 0`), and three sentinels (quorum 2) on TLS (26490-26492)
+  # and on plaintext (26493-26495), so a test can reach the sentinels without TLS and the data nodes with it; all in
+  # the same namespace. The certificates come from `certs`, into a volume the servers and the tests read, verified
+  # against its CA; the server certificate is for 127.0.0.1, and clients are not asked for one.
+
+  # The test image, under the name the `php` service builds it as: started from inside the test container, `certs`
+  # finds it built there, and builds nothing itself.
+  certs:
+    image: laravel-phpredis-sentinel-php
+    build: php
+    profiles: [ 'tls' ]
+    network_mode: none
+    command: [ 'php', '/usr/local/bin/make-certs.php', '/certs' ]
+    volumes:
+      - tls-certs:/certs
+
+  redis-tls-1:
+    <<: *server
+    profiles: [ 'tls' ]
+    command: [ 'redis-server', '--port', '0', '--tls-port', '6490', '--tls-cert-file', '/certs/server.pem',
+               '--tls-key-file', '/certs/server-key.pem', '--tls-ca-cert-file', '/certs/ca.pem', '--tls-auth-clients', 'no',
+               '--tls-replication', 'yes', '--save', '', '--appendonly', 'no' ]
+    environment:
+      PORT: 6490
+    volumes:
+      - tls-certs:/certs:ro
+    healthcheck: *tls-node-health
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  redis-tls-2:
+    <<: *server
+    profiles: [ 'tls' ]
+    command: [ 'redis-server', '--port', '0', '--tls-port', '6491', '--tls-cert-file', '/certs/server.pem',
+               '--tls-key-file', '/certs/server-key.pem', '--tls-ca-cert-file', '/certs/ca.pem', '--tls-auth-clients', 'no',
+               '--tls-replication', 'yes', '--save', '', '--appendonly', 'no', '--replicaof', '127.0.0.1', '6490' ]
+    environment:
+      PORT: 6491
+    volumes:
+      - tls-certs:/certs:ro
+    healthcheck: *tls-node-health
+    depends_on:
+      redis-tls-1:
+        condition: service_healthy
+
+  sentinel-tls-1:
+    <<: *tls-sentinel
+    environment:
+      PORT: 26490
+      PLAIN_PORT: 26493
+
+  sentinel-tls-2:
+    <<: *tls-sentinel
+    environment:
+      PORT: 26491
+      PLAIN_PORT: 26494
+
+  sentinel-tls-3:
+    <<: *tls-sentinel
+    environment:
+      PORT: 26492
+      PLAIN_PORT: 26495
+
   # Where the tests run on Linux (`composer test:linux`), with the working tree mounted. It joins the servers'
   # namespace, so the addresses the sentinels announce are valid in it, and drives the servers through the host's
   # Docker socket, which gives it control of every container on the host, not only these. It does not wait for the
   # servers: the integration tests reset them from whatever state they are in, paused and stopped included.
   php:
+    image: laravel-phpredis-sentinel-php
     build: php
     profiles: [ 'tests' ]
     network_mode: service:network
@@ -130,3 +243,7 @@ services:
     volumes:
       - ..:/package
       - /var/run/docker.sock:/var/run/docker.sock
+      - tls-certs:/certs:ro
+
+volumes:
+  tls-certs:

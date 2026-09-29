@@ -78,7 +78,7 @@ abstract class IntegrationTestCase extends TestCase
      * Typed as what it is: the manager returns the base Connection, whose `@mixin Redis` would resolve scan() to
      * phpredis's own signature instead of Laravel's.
      *
-     * @param  array<string, mixed>  $settings  Added to the connection's block.
+     * @param  array<string, mixed>  $settings  The connection's block, over the default sentinels and service.
      * @param  array<string, mixed>  $options  The global options.
      */
     protected function sentinelConnection(array $settings = [], array $options = []): PhpRedisSentinelConnection
@@ -88,7 +88,7 @@ abstract class IntegrationTestCase extends TestCase
         $app['config']->set('database.redis', [
             'client' => 'phpredis',
             'options' => $options,
-            'default' => ['sentinel_hosts' => self::SENTINEL_HOSTS, 'sentinel_service' => Servers::SERVICE] + $settings,
+            'default' => $settings + ['sentinel_hosts' => self::SENTINEL_HOSTS, 'sentinel_service' => Servers::SERVICE],
         ]);
         $app->forgetInstance('redis');
 

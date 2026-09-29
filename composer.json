@@ -58,7 +58,7 @@
         "test:unit": "@php vendor/bin/phpunit --testsuite=Unit",
         "test:feature": "@php vendor/bin/phpunit --testsuite=Feature",
         "servers:reset": "docker compose --file docker/compose.yaml up --detach --force-recreate --remove-orphans --wait --wait-timeout 60",
-        "servers:stop": "docker compose --file docker/compose.yaml down --remove-orphans",
+        "servers:stop": "docker compose --file docker/compose.yaml --profile tls down --remove-orphans",
         "test:linux": [
             "Composer\\Config::disableProcessTimeout",
             "docker compose --file docker/compose.yaml up --detach network @no_additional_args",

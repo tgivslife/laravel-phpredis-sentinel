@@ -299,6 +299,25 @@ final class Servers
     }
 
     /**
+     * Start the TLS-only servers of the `tls` profile unless they are running, and wait until they are healthy. The
+     * first start also generates the certificates; later ones leave running servers as they are.
+     *
+     * Compose recreates a TLS server whose namespace holder was recreated since (by `composer servers:reset`), which
+     * would otherwise run in a dead namespace; --no-deps keeps it from recreating `network` itself, as reset() does.
+     *
+     * @throws RuntimeException When Docker fails or the servers are not healthy within 90 seconds.
+     */
+    public static function startTls(): void
+    {
+        self::compose(
+            'Starting the TLS servers',
+            150,
+            '--profile', 'tls', 'up', '--detach', '--no-deps', '--wait', '--wait-timeout', '90',
+            'certs', 'redis-tls-1', 'redis-tls-2', 'sentinel-tls-1', 'sentinel-tls-2', 'sentinel-tls-3',
+        );
+    }
+
+    /**
      * Kill the data node on the given port, as a crash would (SIGKILL): its clients' sockets close and its port refuses
      * connections. Its container stays stopped until the next reset.
      *
