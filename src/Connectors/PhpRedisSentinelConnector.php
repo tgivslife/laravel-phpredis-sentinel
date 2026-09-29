@@ -463,6 +463,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
 
         $failures = [];
         $answered = false;
+        $wentAway = 0;
 
         foreach ($hosts as [$host, $port]) {
             if ($deadline?->spent()) {
@@ -476,6 +477,7 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
                     ->getMasterAddrByName($service);
             } catch (RedisException $exception) {
                 $failures[] = "{$host}:{$port} ({$exception->getMessage()})";
+                $wentAway += str_contains($exception->getMessage(), 'went away') ? 1 : 0;
 
                 continue;
             }
@@ -500,34 +502,57 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             return $master;
         }
 
+        // RedisSentinel reports a failed TLS handshake as "went away", as it does a sentinel that is down.
+        $tlsHint = $wentAway === count($hosts) && self::usesSentinelTls($config)
+            ? '; with sentinel TLS configured, a failed handshake reads the same way: check that sentinel_context'
+                .' trusts the sentinels\' certificates and matches the name they are for'
+            : '';
+
         throw new SentinelDiscoveryException(sprintf(
-            'Unable to resolve the Redis master for service [%s] from any configured sentinel: %s',
+            'Unable to resolve the Redis master for service [%s] from any configured sentinel: %s%s',
             $service,
             implode('; ', $failures),
+            $tlsHint,
         ), anySentinelAnswered: $answered);
     }
 
     /**
-     * The master cache key: the service, the sentinel endpoints and a hash of the sentinel credentials.
+     * Whether the sentinels are reached over TLS: a scheme or SSL options for them, either of which turns it on.
      *
-     * A cache hit asks no sentinel, so connections that differ only in their credentials must not share an entry.
-     * Only a hash of them goes into the key, never the values.
+     * @param  array<string, mixed>  $config
+     */
+    private static function usesSentinelTls(array $config): bool
+    {
+        return ConnectionSettings::string($config, 'sentinel_scheme', '') !== '' || isset($config['sentinel_context']);
+    }
+
+    /**
+     * The master cache key: the service, the sentinel endpoints and a hash of how the sentinels are reached, their
+     * credentials and TLS settings.
+     *
+     * A cache hit asks no sentinel, so connections that differ only in those must not share an entry: one with a wrong
+     * password or CA, or no TLS at all, would work until its first rediscovery, during a failover. Only a hash of them
+     * goes into the key, never the values. The context is hashed as configured, so two forms of the same options cost
+     * one discovery more.
      *
      * @param  list<array{0: string, 1: int}>  $hosts  The sentinels, parsed.
      * @param  array<string, mixed>  $config
      *
-     * @throws SentinelConfigurationException When a credential is not a scalar, or the username holds whitespace.
+     * @throws SentinelConfigurationException When a credential or the scheme is not a scalar, or the username holds
+     *                                        whitespace.
      */
     private static function masterCacheKey(string $service, array $hosts, array $config): string
     {
-        $credentials = hash('sha256', serialize([
+        $access = hash('sha256', serialize([
             ConnectionSettings::sentinelUsername($config),
             ConnectionSettings::string($config, 'sentinel_password', ''),
+            ConnectionSettings::string($config, 'sentinel_scheme', ''),
+            $config['sentinel_context'] ?? null,
         ]));
 
         return $service
             .'|'.implode(',', array_map(static fn (array $host): string => "{$host[0]}:{$host[1]}", $hosts))
-            .'|'.$credentials;
+            .'|'.$access;
     }
 
     /**

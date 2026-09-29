@@ -39,6 +39,8 @@ final class ConnectionSettings
         'sentinel_username',
         'sentinel_password',
         'sentinel_timeout',
+        'sentinel_scheme',
+        'sentinel_context',
     ];
 
     /**

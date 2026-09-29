@@ -130,7 +130,8 @@ final class ConnectionSettingsTest extends TestCase
         ConnectionSettings::refuseUnknownSentinelKeys(array_fill_keys(ConnectionSettings::SENTINEL_SETTINGS, 'x') + ['host' => '127.0.0.1']);
 
         $this->expectExceptionObject(new SentinelConfigurationException(
-            'sentinel_hots is not a Sentinel setting; the settings are sentinel_hosts, sentinel_service, sentinel_username, sentinel_password and sentinel_timeout.'
+            'sentinel_hots is not a Sentinel setting; the settings are sentinel_hosts, sentinel_service, sentinel_username,'
+            .' sentinel_password, sentinel_timeout, sentinel_scheme and sentinel_context.'
         ));
 
         ConnectionSettings::refuseUnknownSentinelKeys(['sentinel_hots' => 's1']);

@@ -99,7 +99,94 @@ final class SentinelClientFactoryTest extends TestCase
             'password' => [['sentinel_password' => ['secret']], 'sentinel_password must be a string, array given.'],
             'username' => [['sentinel_username' => ['ops'], 'sentinel_password' => 'secret'], 'sentinel_username must be a string, array given.'],
             'timeout' => [['sentinel_timeout' => [1]], 'sentinel_timeout must be a positive number of seconds, array given.'],
+            'scheme' => [['sentinel_scheme' => ['tls']], 'sentinel_scheme must be a string, array given.'],
+            'context' => [['sentinel_context' => 'verify'], 'sentinel_context must be an array, string given.'],
         ];
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function schemedHosts(): array
+    {
+        return [
+            'a name' => ['s1', 'tls://s1'],
+            'an IPv4 address' => ['10.0.0.1', 'tls://10.0.0.1'],
+            'an IPv6 address, bracketed so the scheme and the address can be told apart' => ['fd00::1', 'tls://[fd00::1]'],
+        ];
+    }
+
+    #[DataProvider('schemedHosts')]
+    public function test_the_sentinel_scheme_goes_before_the_host(string $host, string $schemed): void
+    {
+        $this->assertSame($schemed, $this->factory->options($host, 26379, ['sentinel_scheme' => 'tls'])['host']);
+    }
+
+    /**
+     * @return array<string, array{mixed}>
+     */
+    public static function schemesPhpDoesNotSupport(): array
+    {
+        return [
+            'a typo' => ['tsl'],
+            'another case: transports are case-sensitive' => ['TLS'],
+            'a boolean, which would become 1://' => [true],
+        ];
+    }
+
+    /**
+     * With a transport PHP does not have, RedisSentinel fails with the same "went away" as a sentinel that is down.
+     */
+    #[DataProvider('schemesPhpDoesNotSupport')]
+    public function test_a_scheme_php_does_not_support_is_refused(mixed $scheme): void
+    {
+        try {
+            $this->factory->options('s1', 26379, ['sentinel_scheme' => $scheme]);
+            $this->fail('Expected the scheme to be refused.');
+        } catch (SentinelConfigurationException $exception) {
+            // The list that follows is the platform's own.
+            $this->assertStringStartsWith(
+                sprintf('sentinel_scheme [%s] is not a transport PHP supports; it supports tcp, ', (string) $scheme),
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    public function test_the_data_nodes_scheme_and_context_do_not_reach_the_sentinels(): void
+    {
+        $options = $this->factory->options('s1', 26379, ['scheme' => 'tls', 'context' => ['ssl' => ['verify_peer' => true]]]);
+
+        $this->assertSame('s1', $options['host']);
+        $this->assertArrayNotHasKey('ssl', $options);
+    }
+
+    /**
+     * @return array<string, array{array<array-key, mixed>}>
+     */
+    public static function sentinelContexts(): array
+    {
+        $ssl = ['cafile' => '/certs/ca.pem', 'verify_peer' => true];
+
+        return [
+            'under an ssl key' => [['ssl' => $ssl]],
+            'under a stream key' => [['stream' => $ssl]],
+            'the options themselves' => [$ssl],
+        ];
+    }
+
+    /**
+     * RedisSentinel takes its `ssl` option flat, like a cluster's context, so it is normalised as Laravel normalises
+     * one: every form Laravel accepts for a `context` gives the same options.
+     *
+     * @param  array<array-key, mixed>  $context
+     */
+    #[DataProvider('sentinelContexts')]
+    public function test_the_sentinel_context_becomes_the_flat_ssl_option(array $context): void
+    {
+        $this->assertSame(
+            ['cafile' => '/certs/ca.pem', 'verify_peer' => true],
+            $this->factory->options('s1', 26379, ['sentinel_context' => $context])['ssl'] ?? null,
+        );
     }
 
     public function test_the_password_is_sent_as_written(): void

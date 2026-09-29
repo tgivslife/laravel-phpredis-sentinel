@@ -379,7 +379,7 @@ final class PhpRedisSentinelConnectorTest extends TestCase
         } catch (SentinelConfigurationException $exception) {
             $this->assertSame(
                 "{$key} is not a Sentinel setting; the settings are sentinel_hosts, sentinel_service, sentinel_username,"
-                .' sentinel_password and sentinel_timeout.',
+                .' sentinel_password, sentinel_timeout, sentinel_scheme and sentinel_context.',
                 $exception->getMessage(),
             );
             $this->assertSame(0, $this->discoveries, 'no sentinel is asked');
@@ -801,6 +801,79 @@ final class PhpRedisSentinelConnectorTest extends TestCase
 
         $this->assertSame(['10.0.0.7:6380'], $this->clientHosts, 'still served from the cache');
         $this->assertSame(0, $this->discoveries);
+    }
+
+    /**
+     * @return array<string, array{array<string, mixed>, bool}>
+     */
+    public static function sentinelsThatWentAway(): array
+    {
+        return [
+            'with a sentinel scheme' => [['sentinel_scheme' => 'tls'], true],
+            'with a sentinel context alone' => [['sentinel_context' => ['cafile' => '/certs/ca.pem']], true],
+            'without sentinel TLS' => [[], false],
+        ];
+    }
+
+    /**
+     * RedisSentinel reports a failed TLS handshake as "went away", like a sentinel that is down: with sentinel TLS
+     * configured and every sentinel gone away, the message says so.
+     *
+     * @param  array<string, mixed>  $settings
+     */
+    #[DataProvider('sentinelsThatWentAway')]
+    public function test_a_hint_names_tls_when_every_tls_sentinel_went_away(array $settings, bool $hinted): void
+    {
+        $wentAway = static fn (): never => throw new RedisException('Redis server tls://s1:26379 went away');
+        $connector = $this->connector(['s1:26379' => $wentAway, 's2:26379' => $wentAway]);
+
+        try {
+            $connector->connect($this->config('s1:26379,s2:26379') + $settings, []);
+            $this->fail('Expected discovery to fail.');
+        } catch (SentinelDiscoveryException $exception) {
+            $hint = 'with sentinel TLS configured, a failed handshake reads the same way';
+            $hinted
+                ? $this->assertStringContainsString($hint, $exception->getMessage())
+                : $this->assertStringNotContainsString($hint, $exception->getMessage());
+        }
+    }
+
+    public function test_no_tls_hint_when_a_sentinel_failed_otherwise(): void
+    {
+        $connector = $this->connector([
+            's1:26379' => static fn (): never => throw new RedisException('Redis server tls://s1:26379 went away'),
+            's2:26379' => static fn (): never => throw new RedisException('Connection refused'),
+        ]);
+
+        try {
+            $connector->connect($this->config('s1:26379,s2:26379') + ['sentinel_scheme' => 'tls'], []);
+            $this->fail('Expected discovery to fail.');
+        } catch (SentinelDiscoveryException $exception) {
+            $this->assertStringNotContainsString('failed handshake', $exception->getMessage());
+        }
+    }
+
+    /**
+     * The same for the sentinel TLS settings: one with a wrong CA, or no TLS at all, would reuse a master another
+     * connection found, and first fail during a failover.
+     */
+    public function test_the_master_cache_is_kept_apart_by_sentinel_tls_settings(): void
+    {
+        $connector = $this->connector(['s1:26379' => static fn (): array => ['10.0.0.9', '6380']]);
+        $tls = $this->config('s1:26379') + ['sentinel_scheme' => 'tls', 'sentinel_context' => ['cafile' => '/certs/ca.pem']];
+
+        $connector->connect($tls, []);
+        $connector->connect(['sentinel_context' => ['cafile' => '/certs/other-ca.pem']] + $tls, []);
+        $this->assertSame(2, $this->discoveries, 'a different context discovers');
+
+        $connector->connect(['sentinel_scheme' => ''] + $tls, []);
+        $this->assertSame(3, $this->discoveries, 'no scheme discovers too');
+
+        $connector->connect($this->config('s1:26379'), []);
+        $this->assertSame(4, $this->discoveries, 'and so does no TLS at all');
+
+        $connector->connect($tls, []);
+        $this->assertSame(4, $this->discoveries, 'identical settings share the entry');
     }
 
     /**
