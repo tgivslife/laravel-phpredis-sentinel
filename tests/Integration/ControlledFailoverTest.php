@@ -19,11 +19,6 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
  */
 final class ControlledFailoverTest extends IntegrationTestCase
 {
-    /**
-     * Seconds to wait for a held client to reach the new master: the demotion, then the retry.
-     */
-    private const float RECOVERY_SECONDS = 30;
-
     public function test_a_held_subscriber_moves_to_the_new_master(): void
     {
         $child = $this->subscriber('after');
@@ -211,18 +206,6 @@ final class ControlledFailoverTest extends IntegrationTestCase
     }
 
     /**
-     * Fail over, and wait until the old master reports itself a replica, which it does once it has dropped its
-     * clients; returns the new master's port.
-     */
-    private function failOverAndWaitForTheDemotion(): int
-    {
-        $master = Servers::failover();
-        Servers::waitUntil(fn (): bool => Servers::role(Servers::MASTER) === 'slave', self::RECOVERY_SECONDS, 'the old master to be demoted');
-
-        return $master;
-    }
-
-    /**
      * Scan pages from the cursor, Laravel's way (RedisStore::tags()), until the scan ends or the given number of pages
      * is read; returns the cursor it stopped at and everything the pages returned, merged.
      *
@@ -252,8 +235,8 @@ final class ControlledFailoverTest extends IntegrationTestCase
     }
 
     /**
-     * A child holding a subscription to `news`, with a 1 s read timeout, until the given message arrives. Its result:
-     * the messages received, the port it ended on, the warnings logged and the read timeout afterward.
+     * A child holding a subscription to `news`, with a 1 s read timeout, until the given message arrives.
+     * Its result: the messages received, the port it ended on, the warnings logged and the read timeout afterward.
      */
     private function subscriber(string $last): Child
     {

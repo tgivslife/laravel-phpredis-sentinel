@@ -39,9 +39,12 @@ final class Servers
     private const array SERVICES = ['redis-1', 'redis-2', 'redis-3', 'sentinel-1', 'sentinel-2', 'sentinel-3'];
 
     /**
-     * The data nodes' services, by port.
+     * The servers' services, by port.
      */
-    private const array NODE_SERVICES = [6390 => 'redis-1', 6391 => 'redis-2', 6392 => 'redis-3'];
+    private const array PORT_SERVICES = [
+        6390 => 'redis-1', 6391 => 'redis-2', 6392 => 'redis-3',
+        26390 => 'sentinel-1', 26391 => 'sentinel-2', 26392 => 'sentinel-3',
+    ];
 
     private const float TIMEOUT = 0.5;
 
@@ -303,7 +306,60 @@ final class Servers
      */
     public static function kill(int $port): void
     {
-        self::compose("Killing the node on {$port}", 30, 'kill', self::NODE_SERVICES[$port]);
+        self::compose("Killing the node on {$port}", 30, 'kill', self::PORT_SERVICES[$port]);
+    }
+
+    /**
+     * Stop the servers on the given ports: inside the namespace their ports then refuse connections at once.
+     *
+     * @throws RuntimeException When Docker fails.
+     */
+    public static function stop(int $port, int ...$ports): void
+    {
+        self::onServers('stop', 60, [$port, ...$ports]);
+    }
+
+    /**
+     * Pause the servers on the given ports: their ports still accept connections, which then get no answer, so a
+     * client waits out its read timeout, as with a hung server, and fails with a read error: `read error on connection`
+     * or `socket error on read socket`, both measured. Not a network that drops packets: that never accepts the
+     * connection, so the wait is the connect timeout, with another error.
+     *
+     * @throws RuntimeException When Docker fails.
+     */
+    public static function pause(int $port, int ...$ports): void
+    {
+        self::onServers('pause', 30, [$port, ...$ports]);
+    }
+
+    /**
+     * Let the paused servers on the given ports answer again.
+     *
+     * @throws RuntimeException When Docker fails.
+     */
+    public static function unpause(int $port, int ...$ports): void
+    {
+        self::onServers('unpause', 30, [$port, ...$ports]);
+    }
+
+    /**
+     * Run a docker compose command on the servers on the given ports, named as services.
+     *
+     * At least one, by the callers' signatures: with none, Compose would act on every service, `network` included,
+     * which reset() leaves alone, so a stopped one would stay stopped.
+     *
+     * @param  non-empty-list<int>  $ports
+     *
+     * @throws RuntimeException When Docker fails.
+     */
+    private static function onServers(string $command, int $seconds, array $ports): void
+    {
+        self::compose(
+            ucfirst($command).' '.implode(', ', $ports),
+            $seconds,
+            $command,
+            ...array_map(static fn (int $port): string => self::PORT_SERVICES[$port], $ports),
+        );
     }
 
     /**

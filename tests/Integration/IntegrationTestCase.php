@@ -7,6 +7,7 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 use Closure;
 use Illuminate\Redis\RedisManager;
 use Psr\Log\LoggerInterface;
+use Redis;
 use ReflectionProperty;
 use RuntimeException;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
@@ -20,12 +21,17 @@ use Tgi\LaravelPhpRedisSentinel\Tests\TestCase;
  * A test against the servers of docker/compose.yaml, run in the Linux test container (`composer test:integration`).
  *
  * Every test starts from the canonical state, with no data: servers a previous test left in another state are reset
- * first, and keys it left are flushed. Servers that cannot be reached or reset fail the test instead of skipping it,
- * since a skipped suite would pass CI having shown nothing; phpunit.xml.dist also fails the run on any skipped or
- * incomplete test.
+ * first, and keys it left are flushed.
+ * Servers that cannot be reached or reset fail the test instead of skipping it, since a skipped suite would pass
+ * CI having shown nothing; phpunit.xml.dist also fails the run on any skipped or incomplete test.
  */
 abstract class IntegrationTestCase extends TestCase
 {
+    /**
+     * Seconds to wait for a held client to reach the new master: the demotion, then the retry.
+     */
+    protected const float RECOVERY_SECONDS = 30;
+
     private const string SENTINEL_HOSTS = '127.0.0.1:26390,127.0.0.1:26391,127.0.0.1:26392';
 
     /**
@@ -68,7 +74,7 @@ abstract class IntegrationTestCase extends TestCase
     /**
      * A Sentinel connection opened by Laravel's manager with the package's provider, listing all three sentinels.
      *
-     * Typed as what it is: the manager returns the base Connection, whose `@mixin \Redis` would resolve scan() to
+     * Typed as what it is: the manager returns the base Connection, whose `@mixin Redis` would resolve scan() to
      * phpredis's own signature instead of Laravel's.
      *
      * @param  array<string, mixed>  $settings  Added to the connection's block.
@@ -92,6 +98,18 @@ abstract class IntegrationTestCase extends TestCase
         $this->assertInstanceOf(PhpRedisSentinelConnection::class, $connection);
 
         return $connection;
+    }
+
+    /**
+     * Fail over, and wait until the old master reports itself a replica, which it does once it has dropped its
+     * clients; returns the new master's port.
+     */
+    protected function failOverAndWaitForTheDemotion(): int
+    {
+        $master = Servers::failover();
+        Servers::waitUntil(fn (): bool => Servers::role(Servers::MASTER) === 'slave', self::RECOVERY_SECONDS, 'the old master to be demoted');
+
+        return $master;
     }
 
     /**
