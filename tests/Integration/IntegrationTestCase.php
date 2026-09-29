@@ -33,7 +33,7 @@ abstract class IntegrationTestCase extends TestCase
      */
     protected const float RECOVERY_SECONDS = 30;
 
-    private const string SENTINEL_HOSTS = '127.0.0.1:26390,127.0.0.1:26391,127.0.0.1:26392';
+    protected const string SENTINEL_HOSTS = '127.0.0.1:26390,127.0.0.1:26391,127.0.0.1:26392';
 
     /**
      * The container's logger: the package's warnings, one per retry among them.
