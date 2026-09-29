@@ -10,6 +10,7 @@ use Psr\Log\LoggerInterface;
 use Redis;
 use ReflectionProperty;
 use RuntimeException;
+use Symfony\Component\Process\Process;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Connectors\PhpRedisSentinelConnector;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Child;
@@ -110,6 +111,33 @@ abstract class IntegrationTestCase extends TestCase
         Servers::waitUntil(fn (): bool => Servers::role(Servers::MASTER) === 'slave', self::RECOVERY_SECONDS, 'the old master to be demoted');
 
         return $master;
+    }
+
+    /**
+     * Run PHP code in another process, with `$redis` connected to the master: a publisher or a pusher, say, that waits
+     * for the state it needs and then acts. Code that fails should say why on stderr before a non-zero exit.
+     */
+    protected function inBackground(string $code): Process
+    {
+        $process = new Process([PHP_BINARY, '-r', sprintf(
+            '$redis = new Redis; $redis->connect(%s, %d); %s',
+            var_export(Servers::HOST, true),
+            Servers::MASTER,
+            $code,
+        )]);
+        $process->setTimeout(20)->start();
+
+        return $process;
+    }
+
+    /**
+     * Wait for a process from inBackground() to end, and fail with what it wrote unless it exited with 0.
+     */
+    protected function assertBackgroundSucceeded(Process $process): void
+    {
+        $process->wait();
+
+        $this->assertSame(0, $process->getExitCode(), trim($process->getErrorOutput().$process->getOutput()));
     }
 
     /**

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 
 use Redis;
-use Symfony\Component\Process\Process;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
 
@@ -163,28 +162,5 @@ final class HealthyPathTest extends IntegrationTestCase
         $role = $connection->command('role');
 
         return is_array($role) ? $role[0] : null;
-    }
-
-    /**
-     * Run PHP code in another process, with `$redis` connected to the master.
-     */
-    private function inBackground(string $code): Process
-    {
-        $process = new Process([PHP_BINARY, '-r', sprintf(
-            '$redis = new Redis; $redis->connect(%s, %d); %s',
-            var_export(Servers::HOST, true),
-            Servers::MASTER,
-            $code,
-        )]);
-        $process->setTimeout(20)->start();
-
-        return $process;
-    }
-
-    private function assertBackgroundSucceeded(Process $process): void
-    {
-        $process->wait();
-
-        $this->assertSame(0, $process->getExitCode(), trim($process->getErrorOutput().$process->getOutput()));
     }
 }

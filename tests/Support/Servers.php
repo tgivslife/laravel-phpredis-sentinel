@@ -17,7 +17,7 @@ use Throwable;
  * see both replicas and each other, and no data. differences() checks the topology; flush() empties the data.
  *
  * Nothing checks the rest: CONFIG SET on a node, ACL users, loaded scripts (FLUSHALL keeps them) and SENTINEL SET all
- * outlive a test. A test that changes any of them calls reset() when it ends.
+ * outlive a test. A test that changes any of them puts back what it changed, or calls reset(), when it ends.
  */
 final class Servers
 {
