@@ -20,7 +20,8 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
  *
  * They reach Redis only through the connection, so each is checked the way it is used: the cache, the rate limiter and
  * the queue held across the failover, as a long-running process holds them; the session by a later request in the same
- * worker, which opens a new connection on the master the process cached. A worker's blocking pop runs in a forked child.
+ * long-lived worker, such as Octane's, which opens a new connection on the master the process cached (under php-fpm
+ * the cache lasts one request). A worker's blocking pop runs in a forked child.
  */
 final class LaravelConsumersTest extends IntegrationTestCase
 {

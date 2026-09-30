@@ -28,6 +28,10 @@ use Throwable;
  *
  * A retry may repeat work: a write whose reply was lost, a whole pipeline, or the keys a scan already returned.
  *
+ * Nothing is retried inside a transaction, pipeline or WATCH opened by hand: the retry would run on a new client,
+ * outside it. The failure is raised as phpredis raised it, and the next operation rebuilds the client.
+ * transaction() and pipeline() with a callback replay the whole callback instead.
+ *
  * @internal
  */
 final class PhpRedisSentinelConnection extends PhpRedisConnection
@@ -57,6 +61,11 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * Whether an exhausted budget left the client dead, to be rebuilt before the next operation.
      */
     private bool $clientIsStale = false;
+
+    /**
+     * Whether a WATCH sent through the connection is in force on the client. phpredis's mode does not show it.
+     */
+    private bool $watching = false;
 
     /**
      * While withoutSerializationOrCompression() runs, the phpredis options it turned off, keyed by option, with the
@@ -101,25 +110,30 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * from the cached address and retries there, which would charge extra connects to the deadline without ever
      * rediscovering the master.
      *
+     * Keeps track of WATCH: UNWATCH ends it, and so do a transaction's EXEC and DISCARD, but not a pipeline's.
+     * A WATCH queued in a pipeline counts as soon as it is queued, since the server runs it with the pipeline. One
+     * queued in a transaction, which Redis refuses, counts too, until the transaction ends.
+     *
      * @param  string  $method
      * @param  array<array-key, mixed>  $parameters
      */
     #[\Override]
     public function command($method, array $parameters = [])
     {
-        $timeout = $this->blockingTimeout($method, $parameters);
+        $name = strtolower($method);
+        $endsTransaction = in_array($name, ['exec', 'discard'], true)
+            && ! $this->clientIsStale
+            && $this->client->getMode() === Redis::MULTI;
 
-        if ($timeout === null || $timeout[1] < 0) {
-            return $this->retryOnFailure(fn () => Connection::command($method, $parameters));
+        $result = $this->dispatch($method, $parameters);
+
+        if ($name === 'watch' && $result !== false) {
+            $this->watching = true;
+        } elseif ($name === 'unwatch' || $endsTransaction) {
+            $this->watching = false;
         }
 
-        [$position, $wait] = $timeout;
-
-        if ($wait > 0) {
-            return $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $wait);
-        }
-
-        return $this->popInSlices($method, $parameters, $position);
+        return $result;
     }
 
     /**
@@ -182,12 +196,20 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * {@inheritdoc}
      *
+     * With a callback, the transaction ends in EXEC or DISCARD, and so does any WATCH before it.
+     *
      * @return Redis|array<array-key, mixed>
      */
     #[\Override]
     public function transaction(?callable $callback = null)
     {
-        return $this->retryOnFailure(fn () => parent::transaction($callback));
+        try {
+            return $this->retryOnFailure(fn () => parent::transaction($callback), opensTransaction: true);
+        } finally {
+            if ($callback !== null) {
+                $this->watching = false;
+            }
+        }
     }
 
     /**
@@ -220,6 +242,19 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
             },
             $this->retryPolicy->forBlockingOperations(),
         );
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * A WATCH ends with the socket: phpredis reconnects on the next command without it.
+     */
+    #[\Override]
+    public function disconnect()
+    {
+        $this->watching = false;
+
+        parent::disconnect();
     }
 
     /**
@@ -261,11 +296,25 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * Runs the callback once. Laravel retries opening a pipeline or transaction on a client rebuilt from the cached
      * address; inside retryOnFailure() that would nest a second loop that never rediscovers the master.
+     *
+     * A MULTI that fails to open because a WATCH was lost with the connection is let through: retrying it would open
+     * the transaction on a client that watches nothing. This catches a WATCH sent on the client itself, which the
+     * connection does not see.
      */
     #[\Override]
     protected function retryOnceOnLostConnection(Closure $callback)
     {
-        return $callback();
+        try {
+            return $callback();
+        } catch (Throwable $exception) {
+            if (self::lostWatch($exception) && $this->retryPolicy->isRetryable($exception)) {
+                $this->abandonClient();
+
+                throw new UnretriedFailure($exception);
+            }
+
+            throw $exception;
+        }
     }
 
     /**
@@ -280,30 +329,62 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
+     * Run a command through the retry loop: a blocking pop under its own timeout, or in slices without one.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     */
+    private function dispatch(string $method, array $parameters): mixed
+    {
+        $timeout = $this->blockingTimeout($method, $parameters);
+
+        if ($timeout === null || $timeout[1] < 0) {
+            return $this->retryOnFailure(fn () => Connection::command($method, $parameters));
+        }
+
+        [$position, $wait] = $timeout;
+
+        if ($wait > 0) {
+            return $this->retryOnFailure(fn () => $this->pop($method, $parameters), wait: $wait);
+        }
+
+        return $this->popInSlices($method, $parameters, $position);
+    }
+
+    /**
      * Run the operation, rediscovering the master and retrying on failover-class errors.
      *
      * Under a deadline, every attempt, the first included, runs with the read timeout cut to what is left.
      * A blocking pop's attempts run with their wait plus headroom instead, the deadline moved later by the wait.
      * A stale client rebuilt on the way in that spent the deadline doing so ends the operation before the command runs.
      *
+     * An attempt that starts inside a transaction, pipeline or WATCH opened by hand is not retried, nor is one that
+     * fails because phpredis lost a WATCH with the connection. The client is abandoned and the failure raised as it
+     * came. transaction()'s own MULTI gives its failures the lost-WATCH message too, so that check is left to the
+     * opening of the transaction there, and the rest of the transaction is replayed.
+     *
      * @template TResult
      *
      * @param  callable(): TResult  $callback  The client operation.
      * @param  SentinelRetryPolicy|null  $policy  Overrides the connection's budget, for blocking operations.
      * @param  float|null  $wait  A blocking pop's timeout in seconds; null for everything else.
+     * @param  bool  $opensTransaction  Whether the operation is transaction(), which opens a MULTI of its own.
      * @return TResult
      *
      * @throws SentinelFailoverException When the retry budget is spent (the last failure as previous, if any).
-     * @throws Throwable When the error is not failover-class (propagated untouched).
+     * @throws Throwable When the error is not failover-class, or not retried (propagated untouched).
      */
-    private function retryOnFailure(callable $callback, ?SentinelRetryPolicy $policy = null, ?float $wait = null): mixed
-    {
+    private function retryOnFailure(
+        callable $callback,
+        ?SentinelRetryPolicy $policy = null,
+        ?float $wait = null,
+        bool $opensTransaction = false,
+    ): mixed {
         $startedOn = $this->client;
         $failedOn = null;
 
         try {
             return ($policy ?? $this->retryPolicy)->run(
-                function (?RecoveryDeadline $deadline) use ($callback, $wait, &$failedOn) {
+                function (?RecoveryDeadline $deadline) use ($callback, $wait, $opensTransaction, &$failedOn) {
                     $unreachable = $this->refreshStaleClient($deadline);
 
                     $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
@@ -321,12 +402,22 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
                     $client = $this->client;
 
+                    // A retry would run on a new client, outside what was opened by hand on this one.
+                    $openedByHand = $client->getMode() !== Redis::ATOMIC || $this->watching;
+
                     try {
                         return $readTimeout === null
                             ? $this->withReadTimeoutWithin($deadline, $callback)
                             : $this->withReadTimeout($readTimeout, $callback);
                     } catch (Throwable $exception) {
                         $failedOn = $client;
+
+                        if (($openedByHand || (! $opensTransaction && self::lostWatch($exception)))
+                            && $this->retryPolicy->isRetryable($exception)) {
+                            $this->abandonClient();
+
+                            throw new UnretriedFailure($exception);
+                        }
 
                         throw $exception;
                     }
@@ -335,6 +426,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
                 sprintf('connection [%s]', $this->getName() ?? 'unknown'),
                 max(0, (int) ceil(($wait ?? 0) * 1000)),
             );
+        } catch (UnretriedFailure $unretried) {
+            throw $unretried->failure;
         } catch (SentinelFailoverException $exception) {
             // Flag for a lazy rebuild, since rebuilding now would spend time the deadline refused;
             // a client rebuilt in this operation that nothing has failed on is kept.
@@ -445,16 +538,70 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * The old client is never closed explicitly: its socket may be a persistent one another connection shares, and
      * dropping it is enough.
      *
+     * The new client has no WATCH. Every path here has cleared the flag already, since a watching client is given up
+     * on rather than retried; clearing it again keeps that true of any path added later.
+     *
      * @param  Redis  $client  Untyped, as Laravel's `$client` property is.
      */
     private function replaceClient($client): void
     {
         $this->client = $client;
         $this->clientIsStale = false;
+        $this->watching = false;
 
         if ($this->unpackedOptions !== null) {
             $this->unpack();
         }
+    }
+
+    /**
+     * Give up on a client whose transaction, pipeline or WATCH a failure has broken; the next operation rebuilds it.
+     *
+     * What is still open on it is ended as far as the socket allows: a transaction is discarded, which ends a WATCH
+     * too; a pipeline is dropped, and a WATCH it leaves on the server is ended, since a persistent socket would carry
+     * it into the next connection. Each is best-effort: the socket may be gone.
+     */
+    private function abandonClient(): void
+    {
+        $client = $this->client;
+        $mode = $client->getMode();
+
+        if ($mode === Redis::MULTI) {
+            self::bestEffort(fn () => $client->discard());
+        } else {
+            // A pipeline's DISCARD only drops what it queued here; the server has seen none of it.
+            if ($mode === Redis::PIPELINE) {
+                $client->discard();
+            }
+
+            if ($this->watching && $client->isConnected()) {
+                self::bestEffort(fn () => $client->unwatch());
+            }
+        }
+
+        $this->watching = false;
+        $this->clientIsStale = true;
+    }
+
+    /**
+     * Run a call whose failure changes nothing: the client is being given up on either way.
+     */
+    private static function bestEffort(Closure $call): void
+    {
+        try {
+            $call();
+        } catch (Throwable) {
+            //
+        }
+    }
+
+    /**
+     * Whether phpredis reports the connection lost with a transaction or a WATCH open on it, which it knows of even
+     * for a WATCH sent on the client itself.
+     */
+    private static function lostWatch(Throwable $exception): bool
+    {
+        return str_contains($exception->getMessage(), 'MULTI/watching mode');
     }
 
     /**

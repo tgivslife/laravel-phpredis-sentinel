@@ -102,6 +102,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 return 'PONG';
             }
 
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
+            }
+
             public function getOption(int $option): float
             {
                 return $option === Redis::OPT_READ_TIMEOUT ? $this->readTimeout : 0.0;
@@ -138,6 +143,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             public function ping(): never
             {
                 throw new RedisException('Connection lost');
+            }
+
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
             }
 
             public function getOption(int $option): float
@@ -231,6 +241,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             }
 
             public function discard(): void {}
+
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
+            }
         };
     }
 
@@ -281,6 +296,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 }
 
                 return $step['return'] ?? [];
+            }
+
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
             }
 
             public function getOption(int $option): float
@@ -362,6 +382,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 return $this->page($cursor);
             }
 
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
+            }
+
             public function getOption(int $option): float
             {
                 return $option === Redis::OPT_READ_TIMEOUT ? 2.0 : 0.0;
@@ -419,6 +444,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 }
 
                 return 1;
+            }
+
+            public function getMode(): int
+            {
+                return Redis::ATOMIC;
             }
 
             public function getOption(int $option): int|float
@@ -1102,6 +1132,36 @@ final class PhpRedisSentinelConnectionTest extends TestCase
         $this->assertSame(['q', 'job'], $connection->blpop(['q'], 5));
         $this->assertSame([7.0, 2.0], $client->readTimeouts);
         $this->assertSame([], $refreshes);
+    }
+
+    /**
+     * While a WATCH is in force a failure is not retried, but the pop still waits under its own timeout: it would
+     * otherwise fail at the read timeout, 2 s into a 5 s wait.
+     */
+    public function test_a_blocking_pop_while_watching_waits_its_timeout_plus_headroom_and_is_not_retried(): void
+    {
+        $client = $this->blockingClient([
+            ['return' => true],
+            ['ms' => 5000, 'return' => ['q', 'job']],
+            ['ms' => 3000, 'throw' => 'read error on connection'],
+        ]);
+        $refreshes = [];
+        $connection = $this->connection($client, null, $refreshes, deadlineMs: 5000);
+
+        $connection->watch('k');
+
+        $this->assertSame(['q', 'job'], $connection->blpop(['q'], 5));
+        $this->assertSame(['blpop', [['q'], 5], 7.0], $client->calls[1]);
+
+        try {
+            $connection->blpop(['q'], 5);
+            $this->fail('Expected the failure to be let through.');
+        } catch (RedisException $exception) {
+            $this->assertSame('read error on connection', $exception->getMessage());
+        }
+
+        $this->assertSame([], $refreshes);
+        $this->assertSame([], $this->logger->warnings());
     }
 
     /**

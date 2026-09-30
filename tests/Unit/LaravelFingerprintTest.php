@@ -31,7 +31,8 @@ use ReflectionMethod;
  *   it, or a failover there is not recovered;
  * - the hooks the connection overrides (retryOnceOnLostConnection(), rebuildClient()) are still what the methods
  *   around them call, and Connection::command(), which it calls directly to skip Laravel's retry, still only runs
- *   the command and dispatches its events;
+ *   the command and dispatches its events; and every caller of retryOnceOnLostConnection() runs inside the package's
+ *   retry loop, which is the only place that unwraps the UnretriedFailure it may throw;
  * - createClient() and establishConnection() still send nothing to the server before the connector's own AUTH,
  *   SELECT and CLIENT SETNAME (it strips password, database and name first), and createClient() still applies
  *   max_retries right after connecting, which the connector's zero relies on;
