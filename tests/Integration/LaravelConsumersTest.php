@@ -11,6 +11,7 @@ use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Session\Session;
 use Illuminate\Queue\Jobs\RedisJob;
 use Illuminate\Queue\RedisQueue;
+use PHPUnit\Framework\Attributes\Group;
 use Redis;
 use Tgi\LaravelPhpRedisSentinel\Connections\PhpRedisSentinelConnection;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
@@ -23,6 +24,7 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
  * long-lived worker, such as Octane's, which opens a new connection on the master the process cached (under php-fpm
  * the cache lasts one request). A worker's blocking pop runs in a forked child.
  */
+#[Group('failover')]
 final class LaravelConsumersTest extends IntegrationTestCase
 {
     /**

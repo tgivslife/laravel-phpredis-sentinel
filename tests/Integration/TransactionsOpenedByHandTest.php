@@ -7,6 +7,7 @@ namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 use Closure;
 use Illuminate\Cache\Repository;
 use Illuminate\Contracts\Foundation\Application;
+use PHPUnit\Framework\Attributes\Group;
 use RedisException;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
 use Throwable;
@@ -16,6 +17,7 @@ use Throwable;
  * came: a retry would run on a new client, outside it. Nothing is half-applied, and the next operation rebuilds the
  * client, with no warning.
  */
+#[Group('failover')]
 final class TransactionsOpenedByHandTest extends IntegrationTestCase
 {
     /**

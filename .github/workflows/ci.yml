@@ -176,10 +176,21 @@ jobs:
         run: vendor/bin/phpunit
 
   integration:
-    name: Integration
+    name: Integration - ${{ matrix.tests }}
     runs-on: ubuntu-latest
     # A test stuck in a wait without a limit (a subscription, a paused server) fails here instead of after 6 hours.
-    timeout-minutes: 15
+    timeout-minutes: 20
+
+    # Two runners, each with servers of its own. The failover group, the classes built around SENTINEL FAILOVER, takes
+    # about half the suite's time, each test ending in a reset. Between them the two filters run every test.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tests: failover
+            filter: --group=failover
+          - tests: the rest
+            filter: --exclude-group=failover
 
     steps:
       - name: Checkout code
@@ -194,7 +205,7 @@ jobs:
         run: docker compose --file docker/compose.yaml run --rm --build php composer update --prefer-dist --no-interaction --no-progress
 
       - name: Integration suite
-        run: composer test:integration
+        run: composer test:integration -- ${{ matrix.filter }}
 
       - name: Server logs
         if: failure()

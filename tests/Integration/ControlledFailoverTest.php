@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Integration;
 
 use Closure;
+use PHPUnit\Framework\Attributes\Group;
 use Redis;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Child;
 use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
@@ -17,6 +18,7 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
  * of it, about 10 s later; until then a held client keeps working on the old master. The bounded operations therefore
  * run once the old master reports itself a replica.
  */
+#[Group('failover')]
 final class ControlledFailoverTest extends IntegrationTestCase
 {
     public function test_a_held_subscriber_moves_to_the_new_master(): void

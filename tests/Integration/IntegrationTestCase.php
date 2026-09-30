@@ -25,6 +25,9 @@ use Tgi\LaravelPhpRedisSentinel\Tests\TestCase;
  * first, and keys it left are flushed.
  * Servers that cannot be reached or reset fail the test instead of skipping it, since a skipped suite would pass
  * CI having shown nothing; phpunit.xml.dist also fails the run on any skipped or incomplete test.
+ *
+ * Classes built around SENTINEL FAILOVER are in the `failover` group, which CI runs on a runner of its own, the rest
+ * on another: `composer test:integration -- --group=failover` or `--exclude-group=failover` runs either half.
  */
 abstract class IntegrationTestCase extends TestCase
 {
