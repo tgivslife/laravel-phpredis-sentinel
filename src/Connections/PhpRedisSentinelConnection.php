@@ -63,7 +63,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     private bool $clientIsStale = false;
 
     /**
-     * Whether a WATCH sent through the connection is in force on the client. phpredis's mode does not show it.
+     * Whether the client's socket carries a WATCH sent through the connection. phpredis's mode does not show it.
      */
     private bool $watching = false;
 
@@ -110,7 +110,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * from the cached address and retries there, which would charge extra connects to the deadline without ever
      * rediscovering the master.
      *
-     * Keeps track of WATCH: UNWATCH ends it, and so do a transaction's EXEC and DISCARD, but not a pipeline's.
+     * Keeps track of WATCH: UNWATCH ends it, and so do a transaction's EXEC and DISCARD, but not a pipeline's, and so
+     * does a closed socket, which each attempt checks for.
      * A WATCH queued in a pipeline counts as soon as it is queued, since the server runs it with the pipeline. One
      * queued in a transaction, which Redis refuses, counts too, until the transaction ends.
      *
@@ -242,19 +243,6 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
             },
             $this->retryPolicy->forBlockingOperations(),
         );
-    }
-
-    /**
-     * {@inheritdoc}
-     *
-     * A WATCH ends with the socket: phpredis reconnects on the next command without it.
-     */
-    #[\Override]
-    public function disconnect()
-    {
-        $this->watching = false;
-
-        parent::disconnect();
     }
 
     /**
@@ -401,6 +389,12 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
                     }
 
                     $client = $this->client;
+
+                    // A WATCH ends with its socket: phpredis reconnects on the next command, to a socket that watches
+                    // nothing. A socket that died unnoticed still reports connected, and its WATCH counts as lost.
+                    if ($this->watching && ! $client->isConnected()) {
+                        $this->watching = false;
+                    }
 
                     // A retry would run on a new client, outside what was opened by hand on this one.
                     $openedByHand = $client->getMode() !== Redis::ATOMIC || $this->watching;

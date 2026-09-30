@@ -105,6 +105,15 @@ final class OpenedByHandTest extends TestCase
             $c->watch('k');
             $c->disconnect();
         }, true];
+        yield 'after close() on the client itself' => [static function (PhpRedisSentinelConnection $c): void {
+            $c->watch('k');
+            $c->client()->close();
+        }, true];
+        yield 'after close() on the client itself and a command, which reconnected' => [static function (PhpRedisSentinelConnection $c): void {
+            $c->watch('k');
+            $c->client()->close();
+            $c->set('k', 'v');
+        }, true];
         yield 'after transaction() with a callback' => [static function (PhpRedisSentinelConnection $c): void {
             $c->watch('k');
             $c->transaction(static fn (object $multi): mixed => $multi->set('k', 'v'));

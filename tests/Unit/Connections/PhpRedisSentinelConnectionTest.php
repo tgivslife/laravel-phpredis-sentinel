@@ -107,6 +107,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 return Redis::ATOMIC;
             }
 
+            public function isConnected(): bool
+            {
+                return true;
+            }
+
             public function getOption(int $option): float
             {
                 return $option === Redis::OPT_READ_TIMEOUT ? $this->readTimeout : 0.0;
@@ -148,6 +153,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             public function getMode(): int
             {
                 return Redis::ATOMIC;
+            }
+
+            public function isConnected(): bool
+            {
+                return true;
             }
 
             public function getOption(int $option): float
@@ -246,6 +256,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             {
                 return Redis::ATOMIC;
             }
+
+            public function isConnected(): bool
+            {
+                return true;
+            }
         };
     }
 
@@ -301,6 +316,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             public function getMode(): int
             {
                 return Redis::ATOMIC;
+            }
+
+            public function isConnected(): bool
+            {
+                return true;
             }
 
             public function getOption(int $option): float
@@ -387,6 +407,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 return Redis::ATOMIC;
             }
 
+            public function isConnected(): bool
+            {
+                return true;
+            }
+
             public function getOption(int $option): float
             {
                 return $option === Redis::OPT_READ_TIMEOUT ? 2.0 : 0.0;
@@ -449,6 +474,11 @@ final class PhpRedisSentinelConnectionTest extends TestCase
             public function getMode(): int
             {
                 return Redis::ATOMIC;
+            }
+
+            public function isConnected(): bool
+            {
+                return true;
             }
 
             public function getOption(int $option): int|float

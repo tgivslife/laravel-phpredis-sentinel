@@ -17,7 +17,8 @@ use Throwable;
  * It keeps phpredis's mode: `multi()` and `pipeline()` hand back the client itself and change the mode, a `multi()`
  * inside a pipeline leaves it a pipeline, and `exec()` and `discard()` end the innermost. Queued commands hand back
  * the client too. The failure closes the socket and ends the mode, as a lost connection does, unless it is an error
- * reply (`$errorReply`), which leaves both as they were.
+ * reply (`$errorReply`), which leaves both as they were. `close()` closes the socket too, and the next network call
+ * that answers opens it again, as phpredis reconnects on the next command.
  */
 final class LosingClient
 {
@@ -101,6 +102,12 @@ final class LosingClient
             return $this->connected;
         }
 
+        if ($method === 'close') {
+            $this->connected = false;
+
+            return true;
+        }
+
         if (in_array($method, self::LOCAL, true) || str_starts_with($method, '_')) {
             return in_array($method, ['getlasterror'], true) ? null : true;
         }
@@ -118,6 +125,8 @@ final class LosingClient
 
             throw $failure;
         }
+
+        $this->connected = true;
 
         return match ($method) {
             'pipeline', 'multi' => $this->open($method),
