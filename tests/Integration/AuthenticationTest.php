@@ -116,8 +116,10 @@ final class AuthenticationTest extends IntegrationTestCase
     /**
      * The same with persistent connections, which Laravel's createClient() opens with pconnect() and the persistent ID.
      *
-     * Each client gets an ID of its own, unique to the run: with the same one they would share one socket, and a later
-     * pconnect() could pick up its database and login. Deleting the user afterwards makes Redis close both sockets.
+     * Each client gets an ID of its own, unique to the run, so that each reporting the one it was given shows the ID
+     * reached pconnect(). The IDs do not keep the sockets apart: with phpredis's pooling, on by default, two live
+     * clients never share one, and a released socket goes to the next pconnect() to the same server whatever its ID,
+     * with its database and login. Deleting the user afterwards makes Redis close both sockets, so none is left.
      */
     public function test_a_persistent_client_the_package_builds_is_set_up_as_laravels_own(): void
     {
