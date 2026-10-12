@@ -373,31 +373,9 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
         try {
             return ($policy ?? $this->retryPolicy)->run(
                 function (?RecoveryDeadline $deadline) use ($callback, $wait, $opensTransaction, &$failedOn) {
-                    $unreachable = $this->refreshStaleClient($deadline);
-
-                    $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
-
-                    // Not retryable, so the loop lets it through: the budget was spent before the command ran. A pop
-                    // whose whole wait no longer fits counts as spent too: even an empty wait would end in an error.
-                    // A rebuild that found no sentinel answering is the cause, and names the hosts.
-                    if ($deadline?->spent() || ($readTimeout !== null && $readTimeout <= $wait)) {
-                        throw new SentinelFailoverException(sprintf(
-                            'Redis sentinel connection [%s] gave up: the recovery deadline was spent rebuilding the client%s',
-                            $this->getName() ?? 'unknown',
-                            $unreachable === null ? '' : ': '.$unreachable->getMessage(),
-                        ), 0, $unreachable);
-                    }
-
+                    $readTimeout = $this->startAttempt($deadline, $wait);
                     $client = $this->client;
-
-                    // A WATCH ends with its socket: phpredis reconnects on the next command, to a socket that watches
-                    // nothing. A socket that died unnoticed still reports connected, and its WATCH counts as lost.
-                    if ($this->watching && ! $client->isConnected()) {
-                        $this->watching = false;
-                    }
-
-                    // A retry would run on a new client, outside what was opened by hand on this one.
-                    $openedByHand = $client->getMode() !== Redis::ATOMIC || $this->watching;
+                    $openedByHand = $this->openedByHand();
 
                     try {
                         return $readTimeout === null
@@ -429,6 +407,49 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
             throw $exception;
         }
+    }
+
+    /**
+     * Get an attempt under way: rebuild a stale client, and give up when the deadline is spent before the command
+     * runs; returns a blocking pop's read timeout, or null.
+     *
+     * Giving up here is not retryable, so the loop lets it through. A pop whose whole wait no longer fits counts as
+     * spent too: even an empty wait would end in an error. A rebuild that found no sentinel answering is the cause,
+     * and names the hosts.
+     *
+     * @throws SentinelFailoverException When the deadline is spent, or a blocking pop's wait no longer fits in it.
+     */
+    private function startAttempt(?RecoveryDeadline $deadline, ?float $wait): ?float
+    {
+        $unreachable = $this->refreshStaleClient($deadline);
+
+        $readTimeout = $wait === null ? null : $this->blockingReadTimeout($deadline, $wait);
+
+        if ($deadline?->spent() || ($readTimeout !== null && $readTimeout <= $wait)) {
+            throw new SentinelFailoverException(sprintf(
+                'Redis sentinel connection [%s] gave up: the recovery deadline was spent rebuilding the client%s',
+                $this->getName() ?? 'unknown',
+                $unreachable === null ? '' : ': '.$unreachable->getMessage(),
+            ), 0, $unreachable);
+        }
+
+        return $readTimeout;
+    }
+
+    /**
+     * Whether the client has a transaction, pipeline or WATCH opened by hand: a retry would run on a new client,
+     * outside it.
+     *
+     * A WATCH ends with its socket, and the flag is cleared here: phpredis reconnects on the next command, to a socket
+     * that watches nothing. A socket that died unnoticed still reports connected, and its WATCH counts as lost.
+     */
+    private function openedByHand(): bool
+    {
+        if ($this->watching && ! $this->client->isConnected()) {
+            $this->watching = false;
+        }
+
+        return $this->client->getMode() !== Redis::ATOMIC || $this->watching;
     }
 
     /**
