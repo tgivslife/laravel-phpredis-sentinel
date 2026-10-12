@@ -90,7 +90,7 @@ final class ControlledFailoverTest extends IntegrationTestCase
 
     public function test_a_held_pop_with_a_timeout_moves_to_the_new_master_within_its_wait(): void
     {
-        $child = $this->fork(function (Closure $progress): array {
+        $child = $this->fork(function (): array {
             $connection = $this->sentinelConnection(['read_timeout' => 1.0]);
             $started = hrtime(true);
             $popped = $connection->blpop('jobs', 30);

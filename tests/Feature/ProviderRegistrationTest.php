@@ -108,7 +108,7 @@ final class ProviderRegistrationTest extends TestCase
         $app->forgetInstance('redis');
         $refusals = 0;
 
-        foreach ([1, 2] as $resolution) {
+        for ($resolution = 1; $resolution <= 2; $resolution++) {
             try {
                 $app->make('redis');
             } catch (SentinelConfigurationException) {
