@@ -31,6 +31,16 @@ final class TlsTest extends IntegrationTestCase
     /** @var list<int> */
     private const array TLS_SENTINELS = [26490, 26491, 26492];
 
+    /**
+     * The test CA, which signed the servers' certificate.
+     */
+    private const string CA = '/certs/ca.pem';
+
+    /**
+     * A second CA, which signed nothing the servers present.
+     */
+    private const string OTHER_CA = '/certs/other-ca.pem';
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -77,7 +87,7 @@ final class TlsTest extends IntegrationTestCase
     public function test_a_sentinel_certificate_from_another_ca_fails_discovery_at_once_naming_every_sentinel(): void
     {
         try {
-            $this->tlsConnection(['sentinel_context' => $this->verifiedAgainst('/certs/other-ca.pem')]);
+            $this->tlsConnection(['sentinel_context' => $this->verifiedAgainst(self::OTHER_CA)]);
             $this->fail('Expected discovery to fail.');
         } catch (SentinelDiscoveryException $exception) {
             $this->assertFalse($exception->anySentinelAnswered);
@@ -95,7 +105,7 @@ final class TlsTest extends IntegrationTestCase
 
     public function test_a_data_node_certificate_from_another_ca_fails_opening_without_a_retry(): void
     {
-        $this->assertOpeningFailsOnTheDataNode(['context' => ['ssl' => $this->verifiedAgainst('/certs/other-ca.pem')]], 'certificate verify failed');
+        $this->assertOpeningFailsOnTheDataNode(['context' => ['ssl' => $this->verifiedAgainst(self::OTHER_CA)]], 'certificate verify failed');
     }
 
     /**
@@ -103,7 +113,7 @@ final class TlsTest extends IntegrationTestCase
      */
     public function test_a_certificate_for_another_name_is_refused_on_each_side(): void
     {
-        $elsewhere = ['peer_name' => 'not-127.0.0.1'] + $this->verifiedAgainst('/certs/ca.pem');
+        $elsewhere = ['peer_name' => 'not-127.0.0.1'] + $this->verifiedAgainst(self::CA);
 
         $this->assertOpeningFailsOnTheDataNode(
             ['context' => ['ssl' => $elsewhere]],
@@ -149,9 +159,9 @@ final class TlsTest extends IntegrationTestCase
         return [
             'sentinel_hosts' => self::TLS_SENTINEL_HOSTS,
             'sentinel_scheme' => 'tls',
-            'sentinel_context' => $this->verifiedAgainst('/certs/ca.pem'),
+            'sentinel_context' => $this->verifiedAgainst(self::CA),
             'scheme' => 'tls',
-            'context' => ['ssl' => $this->verifiedAgainst('/certs/ca.pem')],
+            'context' => ['ssl' => $this->verifiedAgainst(self::CA)],
         ];
     }
 
