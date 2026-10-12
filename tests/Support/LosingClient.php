@@ -90,40 +90,12 @@ final class LosingClient
         $method = strtolower($method);
         $this->calls[] = $method;
 
-        if ($method === 'getoption') {
-            return ($arguments[0] ?? null) === Redis::OPT_READ_TIMEOUT ? 2.0 : 0;
-        }
-
-        if ($method === 'getmode') {
-            return $this->mode;
-        }
-
-        if ($method === 'isconnected') {
-            return $this->connected;
-        }
-
-        if ($method === 'close') {
-            $this->connected = false;
-
-            return true;
-        }
-
         if (in_array($method, self::LOCAL, true) || str_starts_with($method, '_')) {
-            return in_array($method, ['getlasterror'], true) ? null : true;
+            return $this->answerLocally($method, $arguments);
         }
 
         if ($this->failure !== null && ($this->failAt === null || $this->failAt === $method) && $this->passes-- <= 0) {
-            $failure = $this->failure;
-            $this->failure = null;
-            $this->failed = true;
-
-            if (! $this->errorReply) {
-                $this->connected = false;
-                $this->mode = Redis::ATOMIC;
-                $this->nestedTransactions = 0;
-            }
-
-            throw $failure;
+            $this->throwFailure($this->failure);
         }
 
         $this->connected = true;
@@ -133,6 +105,43 @@ final class LosingClient
             'exec', 'discard' => $this->end($method),
             default => $this->mode === Redis::ATOMIC ? $this->answer($method) : $this,
         };
+    }
+
+    /**
+     * Answer a call that never reaches the server. `close()` closes the socket.
+     *
+     * @param  array<array-key, mixed>  $arguments
+     */
+    private function answerLocally(string $method, array $arguments): mixed
+    {
+        if ($method === 'close') {
+            $this->connected = false;
+        }
+
+        return match ($method) {
+            'getoption' => ($arguments[0] ?? null) === Redis::OPT_READ_TIMEOUT ? 2.0 : 0,
+            'getmode' => $this->mode,
+            'isconnected' => $this->connected,
+            'getlasterror' => null,
+            default => true,
+        };
+    }
+
+    /**
+     * Throw the failure, once. A lost connection closes the socket and ends the mode; an error reply leaves both.
+     */
+    private function throwFailure(Throwable $failure): never
+    {
+        $this->failure = null;
+        $this->failed = true;
+
+        if (! $this->errorReply) {
+            $this->connected = false;
+            $this->mode = Redis::ATOMIC;
+            $this->nestedTransactions = 0;
+        }
+
+        throw $failure;
     }
 
     private function open(string $method): self
