@@ -143,19 +143,7 @@ final class Child
         $until = hrtime(true) + (int) ($seconds * 1e9);
 
         while (true) {
-            while (($newline = strpos($this->buffer, "\n")) !== false) {
-                $event = json_decode(substr($this->buffer, 0, $newline), true, flags: JSON_THROW_ON_ERROR);
-                $this->buffer = substr($this->buffer, $newline + 1);
-                assert(is_array($event));
-
-                if (isset($event['error'])) {
-                    $this->fail("The child failed: {$event['error']}");
-                }
-
-                if (isset($event['progress']) && is_string($event['progress'])) {
-                    $this->progress[] = $event['progress'];
-                }
-
+            while (($event = $this->nextEvent()) !== null) {
                 if ($matches($event)) {
                     return;
                 }
@@ -167,24 +155,57 @@ final class Child
                 $this->fail(sprintf('The child did not report %s within %.1f s', $waitingFor, $seconds));
             }
 
-            $read = [$this->channel];
-            $write = $except = null;
+            $this->receive($left, $waitingFor);
+        }
+    }
 
-            if (stream_select($read, $write, $except, (int) $left, (int) (fmod($left, 1) * 1e6)) === 0) {
-                continue;
-            }
+    /**
+     * Take the next whole event off the buffer, or null when none is there yet. An error fails the test, and a
+     * progress line is recorded.
+     *
+     * @return array<array-key, mixed>|null
+     */
+    private function nextEvent(): ?array
+    {
+        $newline = strpos($this->buffer, "\n");
 
-            $chunk = fread($this->channel, 65536);
+        if ($newline === false) {
+            return null;
+        }
 
-            if ($chunk === '' || $chunk === false) {
-                if (feof($this->channel)) {
-                    $this->fail("The child ended before it reported {$waitingFor}");
-                }
+        $event = json_decode(substr($this->buffer, 0, $newline), true, flags: JSON_THROW_ON_ERROR);
+        $this->buffer = substr($this->buffer, $newline + 1);
+        assert(is_array($event));
 
-                continue;
-            }
+        if (isset($event['error'])) {
+            $this->fail("The child failed: {$event['error']}");
+        }
 
+        if (isset($event['progress']) && is_string($event['progress'])) {
+            $this->progress[] = $event['progress'];
+        }
+
+        return $event;
+    }
+
+    /**
+     * Wait at most the given time for more from the child, and add it to the buffer; fail the test if the child ended.
+     */
+    private function receive(float $seconds, string $waitingFor): void
+    {
+        $read = [$this->channel];
+        $write = $except = null;
+
+        if (stream_select($read, $write, $except, (int) $seconds, (int) (fmod($seconds, 1) * 1e6)) === 0) {
+            return;
+        }
+
+        $chunk = fread($this->channel, 65536);
+
+        if ($chunk !== '' && $chunk !== false) {
             $this->buffer .= $chunk;
+        } elseif (feof($this->channel)) {
+            $this->fail("The child ended before it reported {$waitingFor}");
         }
     }
 
