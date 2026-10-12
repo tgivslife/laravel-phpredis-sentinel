@@ -716,7 +716,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      */
     private function finiteReadTimeout(): float
     {
-        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
+        $configured = ReadTimeout::effective($this->client->getOption(Redis::OPT_READ_TIMEOUT));
 
         return $configured > 0 ? $configured : self::NO_LIMIT_STANDIN_SECONDS;
     }
@@ -745,7 +745,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
             return $callback();
         }
 
-        $configured = ReadTimeout::effective((float) $this->client->getOption(Redis::OPT_READ_TIMEOUT));
+        $configured = ReadTimeout::effective($this->client->getOption(Redis::OPT_READ_TIMEOUT));
 
         return $this->withReadTimeout($deadline->clamp($configured), $callback);
     }
@@ -762,7 +762,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     private function withReadTimeout(float $seconds, callable $callback): mixed
     {
         $client = $this->client;
-        $previous = ReadTimeout::effective((float) $client->getOption(Redis::OPT_READ_TIMEOUT));
+        $previous = ReadTimeout::effective($client->getOption(Redis::OPT_READ_TIMEOUT));
 
         $client->setOption(Redis::OPT_READ_TIMEOUT, $seconds);
 

@@ -15,10 +15,15 @@ namespace Tgi\LaravelPhpRedisSentinel\Support;
 final class ReadTimeout
 {
     /**
-     * The effective read timeout in seconds: `default_socket_timeout` for 0, any other value as it is.
+     * The effective read timeout in seconds: `default_socket_timeout` for 0, any other number as it is.
+     *
+     * Takes what getOption(Redis::OPT_READ_TIMEOUT) returned. phpredis returns a float, but its stub declares
+     * getOption() as mixed; anything that is not a number counts as 0.
      */
-    public static function effective(float $seconds): float
+    public static function effective(mixed $reported): float
     {
+        $seconds = is_int($reported) || is_float($reported) ? (float) $reported : 0.0;
+
         return $seconds === 0.0 ? (float) ini_get('default_socket_timeout') : $seconds;
     }
 }

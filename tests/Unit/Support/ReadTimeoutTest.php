@@ -24,5 +24,18 @@ final class ReadTimeoutTest extends TestCase
     {
         $this->assertSame(2.5, ReadTimeout::effective(2.5));
         $this->assertSame(-1.0, ReadTimeout::effective(-1.0), 'phpredis reads -1 as no limit');
+        $this->assertSame(3.0, ReadTimeout::effective(3));
+    }
+
+    public function test_a_value_that_is_not_a_number_counts_as_zero(): void
+    {
+        $previous = ini_set('default_socket_timeout', '7');
+
+        try {
+            $this->assertSame(7.0, ReadTimeout::effective(false));
+            $this->assertSame(7.0, ReadTimeout::effective(null));
+        } finally {
+            ini_set('default_socket_timeout', (string) $previous);
+        }
     }
 }
