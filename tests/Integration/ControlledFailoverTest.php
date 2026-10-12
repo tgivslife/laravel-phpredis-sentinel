@@ -23,7 +23,7 @@ final class ControlledFailoverTest extends IntegrationTestCase
 {
     public function test_a_held_subscriber_moves_to_the_new_master(): void
     {
-        $child = $this->subscriber('after');
+        $child = $this->subscriber(messages: 2);
         $this->waitForSubscriber(Servers::MASTER);
         Servers::node(Servers::MASTER)->publish('news', 'before');
         $child->waitFor('received before', 5);
@@ -41,7 +41,7 @@ final class ControlledFailoverTest extends IntegrationTestCase
 
     public function test_a_held_subscriber_survives_two_separate_failovers(): void
     {
-        $child = $this->subscriber('after second');
+        $child = $this->subscriber(messages: 2);
         $this->waitForSubscriber(Servers::MASTER);
 
         $first = Servers::failover();
@@ -237,20 +237,20 @@ final class ControlledFailoverTest extends IntegrationTestCase
     }
 
     /**
-     * A child holding a subscription to `news`, with a 1 s read timeout, until the given message arrives.
+     * A child holding a subscription to `news`, with a 1 s read timeout, until the given number of messages arrive.
      * Its result: the messages received, the port it ended on, the warnings logged and the read timeout afterward.
      */
-    private function subscriber(string $last): Child
+    private function subscriber(int $messages): Child
     {
-        return $this->fork(function (Closure $progress) use ($last): array {
+        return $this->fork(function (Closure $progress) use ($messages): array {
             $connection = $this->sentinelConnection(['read_timeout' => 1.0]);
             $received = [];
 
-            $connection->subscribe('news', function (string $message) use ($connection, $progress, $last, &$received): void {
+            $connection->subscribe('news', function (string $message) use ($connection, $progress, $messages, &$received): void {
                 $received[] = $message;
                 $progress("received {$message}");
 
-                if ($message === $last) {
+                if (count($received) === $messages) {
                     $connection->client()->unsubscribe(['news']);
                 }
             });
