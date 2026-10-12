@@ -183,7 +183,7 @@ final class ControlledFailoverTest extends IntegrationTestCase
         $scanning->mset(array_fill_keys($keys, '1'));
         $members = array_map(fn (int $index): string => "member:{$index}", range(1, 2000));
         $scanning->zadd('ranked', array_fill_keys($members, 1));
-        $this->assertSame(2, $scanning->client()->wait(2, 1000), 'on both replicas before the failover');
+        $this->assertOnBothReplicas($scanning);
 
         // Two pages each on the old master, then the rest after the failover.
         $scan = fn (mixed $cursor) => $scanning->scan($cursor, ['match' => 'scanned:*', 'count' => 50]);

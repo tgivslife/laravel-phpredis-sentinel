@@ -105,6 +105,14 @@ abstract class IntegrationTestCase extends TestCase
     }
 
     /**
+     * Wait, up to a second, until both replicas acknowledge what the connection wrote, so a failover loses none of it.
+     */
+    protected function assertOnBothReplicas(PhpRedisSentinelConnection $connection): void
+    {
+        $this->assertSame(2, $connection->client()->wait(2, 1000), 'on both replicas before the failover');
+    }
+
+    /**
      * Fail over, and wait until the old master reports itself a replica, which it does once it has dropped its
      * clients; returns the new master's port.
      */

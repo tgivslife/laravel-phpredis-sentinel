@@ -28,6 +28,11 @@ use Tgi\LaravelPhpRedisSentinel\Tests\Support\Servers;
 final class LaravelConsumersTest extends IntegrationTestCase
 {
     /**
+     * The job the queue tests push. Nothing runs it: the tests pop it and read its payload.
+     */
+    private const string JOB = 'Handler@handle';
+
+    /**
      * @param  Application  $app
      */
     #[\Override]
@@ -61,7 +66,7 @@ final class LaravelConsumersTest extends IntegrationTestCase
         $lock = $cache->lock('report', 60);
         $this->assertTrue($lock->get());
         $this->assertTrue($writingCache->has('before'), 'held: open on the old master');
-        $this->assertSame(2, $reading->client()->wait(2, 1000), 'on both replicas before the failover');
+        $this->assertOnBothReplicas($reading);
 
         $master = $this->failOverAndWaitForTheDemotion();
 
@@ -92,7 +97,7 @@ final class LaravelConsumersTest extends IntegrationTestCase
 
         $this->assertSame(1, $limiter->hit('login'));
         $this->assertSame(2, $limiter->hit('login'));
-        $this->assertSame(2, $connection->client()->wait(2, 1000), 'on both replicas before the failover');
+        $this->assertOnBothReplicas($connection);
 
         $master = $this->failOverAndWaitForTheDemotion();
 
@@ -111,7 +116,7 @@ final class LaravelConsumersTest extends IntegrationTestCase
         $session = $this->redisSession();
         $session->put('user', 42);
         $session->save();
-        $this->assertSame(2, $connection->client()->wait(2, 1000), 'on both replicas before the failover');
+        $this->assertOnBothReplicas($connection);
 
         $master = $this->failOverAndWaitForTheDemotion();
 
@@ -143,14 +148,14 @@ final class LaravelConsumersTest extends IntegrationTestCase
         $pushing = $this->request();
         $bulkQueue = $this->queue();
 
-        $queue->push('Handler@handle', ['job' => 'immediate']);
-        $queue->later(1, 'Handler@handle', ['job' => 'delayed']);
+        $queue->push(self::JOB, ['job' => 'immediate']);
+        $queue->later(1, self::JOB, ['job' => 'delayed']);
         $this->assertSame(2, $bulkQueue->size(), 'held: open on the old master');
-        $this->assertSame(2, $popping->client()->wait(2, 1000), 'on both replicas before the failover');
+        $this->assertOnBothReplicas($popping);
 
         $master = $this->failOverAndWaitForTheDemotion();
 
-        $bulkQueue->bulk(['Handler@handle', 'Handler@handle'], ['job' => 'bulk'], 'bulk');
+        $bulkQueue->bulk([self::JOB, self::JOB], ['job' => 'bulk'], 'bulk');
 
         // The delayed job is due by now: the first pop moves it to the queue, behind the other.
         $immediate = $this->pop($queue);
@@ -196,7 +201,7 @@ final class LaravelConsumersTest extends IntegrationTestCase
         $master = Servers::failover();
         Servers::waitUntil(fn (): bool => Servers::blockedClients($master) > 0, self::RECOVERY_SECONDS, 'the worker to block on the new master');
         $this->request();
-        $this->queue()->push('Handler@handle', ['job' => 'after']);
+        $this->queue()->push(self::JOB, ['job' => 'after']);
         $result = $child->result(5);
 
         $this->assertSame('after', $result['job']);
