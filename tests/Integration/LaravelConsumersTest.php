@@ -262,9 +262,4 @@ final class LaravelConsumersTest extends IntegrationTestCase
 
         return $job;
     }
-
-    private function application(): Application
-    {
-        return $this->app ?? $this->fail('The application is not booted.');
-    }
 }

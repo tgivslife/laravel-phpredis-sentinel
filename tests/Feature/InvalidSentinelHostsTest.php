@@ -81,7 +81,7 @@ final class InvalidSentinelHostsTest extends TestCase
      */
     private function redis(array $connections): RedisManager
     {
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $app['config']->set('database.redis', ['client' => 'phpredis', 'options' => ['prefix' => 'app:']] + $connections);
         $app->forgetInstance('redis');

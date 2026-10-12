@@ -127,7 +127,7 @@ final class TransactionsOpenedByHandTest extends IntegrationTestCase
 
     private function cache(): Repository
     {
-        $cache = ($this->app ?? $this->fail('The application is not booted.'))['cache']->store('redis');
+        $cache = $this->application()['cache']->store('redis');
         $this->assertInstanceOf(Repository::class, $cache);
 
         return $cache;

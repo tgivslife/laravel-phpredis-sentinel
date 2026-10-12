@@ -63,7 +63,7 @@ abstract class IntegrationTestCase extends TestCase
         (new ReflectionProperty(PhpRedisSentinelConnector::class, 'resolvedMasters'))->setValue(null, []);
 
         $this->logger = new RecordingLogger;
-        ($this->app ?? $this->fail('The application is not booted.'))->instance(LoggerInterface::class, $this->logger);
+        $this->application()->instance(LoggerInterface::class, $this->logger);
     }
 
     protected function tearDown(): void
@@ -86,7 +86,7 @@ abstract class IntegrationTestCase extends TestCase
      */
     protected function sentinelConnection(array $settings = [], array $options = []): PhpRedisSentinelConnection
     {
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $app['config']->set('database.redis', [
             'client' => 'phpredis',

@@ -103,7 +103,7 @@ final class ProviderRegistrationTest extends TestCase
     public function test_a_refused_configuration_is_refused_on_every_resolution(): void
     {
         // A worker that catches the first refusal must not get an unchecked manager from the second resolution.
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
         $app['config']->set('database.redis', ['client' => 'predis', 'default' => ['sentinel_hosts' => 's1:26379']]);
         $app->forgetInstance('redis');
         $refusals = 0;
@@ -122,7 +122,7 @@ final class ProviderRegistrationTest extends TestCase
     public function test_a_phpredis_client_resolved_through_the_container_is_left_alone(): void
     {
         // PHP class names ignore case, so a hook on 'redis' matched by type would also catch phpredis's Redis class.
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $this->assertInstanceOf(Redis::class, $app->make(Redis::class));
     }
@@ -153,7 +153,7 @@ final class ProviderRegistrationTest extends TestCase
      */
     private function resolveRedis(array $config): RedisManager
     {
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $app['config']->set('database.redis', $config);
         $app->forgetInstance('redis');

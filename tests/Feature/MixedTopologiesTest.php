@@ -69,7 +69,7 @@ final class MixedTopologiesTest extends TestCase
      */
     private function redis(): RedisManager
     {
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $app['config']->set('database.redis', [
             'client' => 'phpredis',

@@ -244,7 +244,7 @@ final class AuthenticationTest extends IntegrationTestCase
      */
     private function bothClients(array $settings, array $plainOnly = [], array $sentinelOnly = []): array
     {
-        $app = $this->app ?? $this->fail('The application is not booted.');
+        $app = $this->application();
 
         $app['config']->set('database.redis', [
             'client' => 'phpredis',
