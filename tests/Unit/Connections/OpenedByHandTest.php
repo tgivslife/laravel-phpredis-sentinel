@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Connections;
 
+use ArrayObject;
 use Closure;
 use LogicException;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -407,15 +408,18 @@ final class OpenedByHandTest extends TestCase
      */
     public function test_an_error_reply_inside_a_transaction_callback_is_discarded_before_the_replay(): void
     {
-        $client = new LosingClient(new RedisException("READONLY You can't write against a read only replica."), 'set', errorReply: true);
-        $replacement = new LosingClient(null);
+        $log = new ArrayObject;
+        $client = new LosingClient(new RedisException("READONLY You can't write against a read only replica."), 'set', errorReply: true, log: $log);
+        $replacement = new LosingClient(null, log: $log);
         $connection = $this->connection($client, $replacement);
 
         $connection->transaction(static fn (object $multi): mixed => $multi->set('k', 'v'));
 
-        $this->assertSame(['multi', 'set', 'discard'], $client->sent());
+        $this->assertSame(
+            ['old multi', 'old set', 'old discard', 'new multi', 'new set', 'new exec'],
+            array_map(static fn (array $call): string => ($call[0] === $client ? 'old ' : 'new ').$call[1], $log->getArrayCopy()),
+        );
         $this->assertSame(Redis::ATOMIC, $client->mode);
-        $this->assertSame(['multi', 'set', 'exec'], $replacement->sent());
         $this->assertSame([true], $this->refreshes);
         $this->assertCount(1, $this->logger->warnings());
     }

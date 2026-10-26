@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Support;
 
+use ArrayObject;
 use Redis;
 use Throwable;
 
@@ -20,6 +21,9 @@ use Throwable;
  * client too. The failure closes the socket and ends the mode, as a lost connection does, unless it is an error
  * reply (`$errorReply`), which leaves both as they were. `close()` closes the socket too, and the next network call
  * that answers opens it again, as phpredis reconnects on the next command.
+ *
+ * Clients given one log (`$log`) append each network call to it, with themselves, the failing call included, so the
+ * order of calls across a client and its replacement shows.
  */
 final class LosingClient
 {
@@ -62,12 +66,15 @@ final class LosingClient
      * @param  string|null  $failAt  Fail the first call to this method instead of the first network call.
      * @param  bool  $errorReply  Whether the failure is an error reply, leaving the socket open and the mode as it was.
      * @param  int  $passes  How many calls to $failAt answer before the one that fails.
+     * @param  ArrayObject<int, array{self, string}>|null  $log  Shared with other clients: each network call, with
+     *                                                           the client that made it, in order.
      */
     public function __construct(
         private ?Throwable $failure,
         private readonly ?string $failAt = null,
         private readonly bool $errorReply = false,
         private int $passes = 0,
+        private readonly ?ArrayObject $log = null,
     ) {}
 
     /**
@@ -94,6 +101,8 @@ final class LosingClient
         if (in_array($method, self::LOCAL, true) || str_starts_with($method, '_')) {
             return $this->answerLocally($method, $arguments);
         }
+
+        $this->log?->append([$this, $method]);
 
         if ($this->failure !== null && ($this->failAt === null || $this->failAt === $method) && $this->passes-- <= 0) {
             $this->throwFailure($this->failure);
