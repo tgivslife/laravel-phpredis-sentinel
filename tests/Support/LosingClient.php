@@ -15,8 +15,9 @@ use Throwable;
  * calls and never fail.
  *
  * It keeps phpredis's mode: `multi()` and `pipeline()` hand back the client itself and change the mode, a `multi()`
- * inside a pipeline leaves it a pipeline, and `exec()` and `discard()` end the innermost. Queued commands hand back
- * the client too. The failure closes the socket and ends the mode, as a lost connection does, unless it is an error
+ * inside a pipeline leaves it a pipeline, `exec()` ends the innermost, a transaction's EXEC inside a pipeline being
+ * only queued, and `discard()` ends them all, as phpredis drops the whole pipeline. Queued commands hand back the
+ * client too. The failure closes the socket and ends the mode, as a lost connection does, unless it is an error
  * reply (`$errorReply`), which leaves both as they were. `close()` closes the socket too, and the next network call
  * that answers opens it again, as phpredis reconnects on the next command.
  */
@@ -160,13 +161,14 @@ final class LosingClient
      */
     private function end(string $method): array|bool|self
     {
-        if ($this->nestedTransactions > 0) {
+        if ($method === 'exec' && $this->nestedTransactions > 0) {
             $this->nestedTransactions--;
 
             return $this;
         }
 
         $this->mode = Redis::ATOMIC;
+        $this->nestedTransactions = 0;
 
         return $method === 'exec' ? [] : true;
     }

@@ -442,6 +442,30 @@ final class OpenedByHandTest extends TestCase
     }
 
     /**
+     * Laravel's queue bulk push: a transaction nested in a pipeline whose callback throws is discarded, and phpredis
+     * drops the whole pipeline with it, so the failure reaches the caller with nothing sent. The outer pipeline then
+     * finds its client out of pipeline mode and discards nothing more.
+     */
+    public function test_a_failed_transaction_nested_in_a_pipeline_drops_the_whole_pipeline(): void
+    {
+        $client = new LosingClient(null);
+        $connection = $this->connection($client, new LosingClient(null));
+        $failure = new LogicException('a job failed to serialize');
+
+        $this->assertSame($failure, $this->thrownBy(fn () => $connection->pipeline(
+            static fn (): mixed => $connection->transaction(static function (object $multi) use ($failure): never {
+                $multi->set('k', 'v');
+
+                throw $failure;
+            }),
+        )));
+        $this->assertSame(['pipeline', 'multi', 'set', 'discard'], $client->sent(), 'one DISCARD, no EXEC');
+        $this->assertSame(Redis::ATOMIC, $client->mode);
+        $this->assertSame([], $this->refreshes);
+        $this->assertSame([], $this->logger->warnings());
+    }
+
+    /**
      * A connection whose connector records its refresh flags and hands back the replacement.
      */
     private function connection(LosingClient $client, LosingClient $replacement): PhpRedisSentinelConnection

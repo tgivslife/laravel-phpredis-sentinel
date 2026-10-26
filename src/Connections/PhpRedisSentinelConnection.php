@@ -310,8 +310,10 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      *
      * A failure is raised for the retry loop to judge. One that leaves the pipeline or transaction open, a callback
      * that throws or an error reply inside a MULTI, first discards what is still queued, best-effort, so the client
-     * is not left in it. A socket failure has ended it already, and is not discarded: after a read error phpredis
-     * would reconnect to the client's address, after a failover the old master, and send its AUTH and SELECT there.
+     * is not left in it. For a transaction nested in a pipeline that is the whole outer pipeline, which phpredis
+     * drops with it, as under Laravel's transaction(). A socket failure has ended it already, and is not discarded:
+     * after a read error phpredis would reconnect to the client's address, after a failover the old master, and send
+     * its AUTH and SELECT there.
      *
      * @param  Redis  $opened  What pipeline() or multi() handed back, in phpredis the client itself; untyped, as the
      *                         client is.
