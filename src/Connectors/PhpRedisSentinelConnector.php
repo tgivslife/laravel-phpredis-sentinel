@@ -502,18 +502,26 @@ final class PhpRedisSentinelConnector extends PhpRedisConnector
             return $master;
         }
 
-        // RedisSentinel reports a failed TLS handshake as "went away", as it does a sentinel that is down.
-        $tlsHint = $wentAway === count($hosts) && self::usesSentinelTls($config)
-            ? '; with sentinel TLS configured, a failed handshake reads the same way: check that sentinel_context'
-                .' trusts the sentinels\' certificates and matches the name they are for'
-            : '';
-
         throw new SentinelDiscoveryException(sprintf(
             'Unable to resolve the Redis master for service [%s] from any configured sentinel: %s%s',
             $service,
             implode('; ', $failures),
-            $tlsHint,
+            self::tlsHint($config, $wentAway === count($hosts)),
         ), anySentinelAnswered: $answered);
+    }
+
+    /**
+     * The hint a discovery failure ends with when every sentinel went away and sentinel TLS is configured; otherwise
+     * empty. RedisSentinel reports a failed TLS handshake as "went away", as it does a sentinel that is down.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    private static function tlsHint(array $config, bool $everySentinelWentAway): string
+    {
+        return $everySentinelWentAway && self::usesSentinelTls($config)
+            ? '; with sentinel TLS configured, a failed handshake reads the same way: check that sentinel_context'
+                .' trusts the sentinels\' certificates and matches the name they are for'
+            : '';
     }
 
     /**
