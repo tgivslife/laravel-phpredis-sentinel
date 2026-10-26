@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit;
+namespace Tgi\LaravelPhpRedisSentinel\Tests\Fingerprint;
 
 use Composer\InstalledVersions;
 use Illuminate\Redis\Connections\PhpRedisConnection;
@@ -21,6 +21,12 @@ use ReflectionMethod;
  * PhpRedisConnector, traits' included, and the RedisManager methods the provider relies on, is hashed over its tokens
  * without whitespace or comments, so a reformat passes and any other change, a refactor included, fails with the
  * method it touched.
+ *
+ * This suite is left out of the default run: CI runs it against the newest Laravel and turns its failure into a
+ * warning, and `composer test:fingerprint` runs it by hand. The package keeps working on a release it was not
+ * reviewed against, and the tests of its behaviour are what fail when one breaks it: LaravelReconnectContractTest,
+ * LaravelLostConnectionParityTest and the Integration suite. A failure here says only that the code to review has
+ * changed. REVIEWED holds one release, so a run against an older one, the floor included, reports the difference.
  *
  * Before updating a fingerprint, read the diff the failure names and check:
  *
@@ -44,7 +50,7 @@ final class LaravelFingerprintTest extends TestCase
     /**
      * The laravel/framework release the fingerprints were reviewed against.
      */
-    private const string REVIEWED_LARAVEL = '13.33.0';
+    private const string REVIEWED_LARAVEL = '13.38.0';
 
     /**
      * The RedisManager methods the provider relies on.
@@ -86,7 +92,7 @@ final class LaravelFingerprintTest extends TestCase
         'PhpRedisConnection::__construct' => '4236cd156455fd19',
         'PhpRedisConnection::blpop' => 'c993abed8eb72399',
         'PhpRedisConnection::brpop' => 'cf65797d43a8dcd1',
-        'PhpRedisConnection::causedByLostConnection' => '663710a59deb45ac',
+        'PhpRedisConnection::causedByLostConnection' => '4dd1dbec1670dba5',
         'PhpRedisConnection::command' => 'ead97c51e0038037',
         'PhpRedisConnection::compressed' => '9a90190647a999a9',
         'PhpRedisConnection::createSubscription' => '332c7cfb39fd8a7f',
@@ -109,7 +115,7 @@ final class LaravelFingerprintTest extends TestCase
         'PhpRedisConnection::phpRedisVersionAtLeast' => '0ce5c9be5ea7d7c6',
         'PhpRedisConnection::pipeline' => 'b2061084e2be3a2c',
         'PhpRedisConnection::psubscribe' => 'ef2faf907066be2f',
-        'PhpRedisConnection::rebuildClient' => 'e05ebcd4b0bed4d4',
+        'PhpRedisConnection::rebuildClient' => '50e6558b15b8e13e',
         'PhpRedisConnection::rebuildClientOnLostConnection' => '92354281b262e044',
         'PhpRedisConnection::retryOnceOnLostConnection' => '1a6965d03b595691',
         'PhpRedisConnection::scan' => '9be4082e4199c925',

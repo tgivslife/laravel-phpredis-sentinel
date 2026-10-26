@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Recovery;
 
+use Composer\InstalledVersions;
 use ErrorException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -23,12 +24,19 @@ use Throwable;
 final class LaravelLostConnectionParityTest extends TestCase
 {
     /**
-     * Fragments deliberately not retried, and why.
+     * Fragments deliberately not retried, why, and the first supported Laravel release that lists them.
      *
-     * @var array<string, string>
+     * @var array<string, array{reason: string, since: string}>
      */
     private const array EXCLUDED = [
-        'Error processing response from Redis node' => 'raised by RedisCluster only; a Sentinel connection never is one',
+        'Error processing response from Redis node' => [
+            'reason' => 'raised by RedisCluster only; a Sentinel connection never is one',
+            'since' => '13.33.0',
+        ],
+        "Can't communicate with any node in the cluster" => [
+            'reason' => 'raised by RedisCluster only; a Sentinel connection never is one',
+            'since' => '13.36.0',
+        ],
     ];
 
     /**
@@ -57,7 +65,11 @@ final class LaravelLostConnectionParityTest extends TestCase
     public function test_every_exclusion_is_still_one_laravel_recognises(): void
     {
         // An exclusion Laravel dropped is a dead entry, and one it renamed would hide the new wording from the test.
-        $this->assertSame([], array_diff(array_keys(self::EXCLUDED), LaravelLostConnectionMessages::fragments()));
+        // One newer than the installed release is not listed yet: the lowest-dependency jobs run the Laravel floor.
+        $installed = ltrim((string) InstalledVersions::getPrettyVersion('laravel/framework'), 'v');
+        $listed = array_filter(self::EXCLUDED, static fn (array $exclusion): bool => version_compare($installed, $exclusion['since'], '>='));
+
+        $this->assertSame([], array_diff(array_keys($listed), LaravelLostConnectionMessages::fragments()));
     }
 
     public function test_an_excluded_fragment_is_not_retried(): void

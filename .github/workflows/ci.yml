@@ -58,6 +58,15 @@ jobs:
       - name: PHPStan
         run: composer analyse
 
+      # This job installs the newest Laravel. A change to the Laravel code the package depends on is a warning, not a
+      # failure: the package keeps working on a release it was not reviewed against, and the tests of its behaviour
+      # fail when one breaks it. The warning shows on the run's summary until the change is reviewed.
+      - name: Laravel fingerprint
+        run: |
+          if ! composer test:fingerprint; then
+            echo "::warning title=Laravel changed::The Laravel code the package depends on differs from what was reviewed; this step's log names the methods and the diff to read"
+          fi
+
   dependencies:
     name: Runtime dependencies
     runs-on: ubuntu-latest

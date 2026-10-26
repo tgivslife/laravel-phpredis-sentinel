@@ -42,7 +42,8 @@ final class SentinelRetryPolicy
      * RedisException or an ErrorException.
      *
      * Includes every fragment Laravel's PhpRedisConnection::command() recovers from, since the connection bypasses
-     * that loop, except the RedisCluster-only `Error processing response from Redis node`.
+     * that loop, except the RedisCluster-only `Error processing response from Redis node` and `Can't communicate with
+     * any node in the cluster`.
      *
      * `instance state changed` is the `UNBLOCKED` error a demoted master gives its blocked clients.
      * `actively refused` and `did not properly respond` are how Windows words a refused and an unanswered connect.
