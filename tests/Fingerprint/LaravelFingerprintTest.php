@@ -35,10 +35,10 @@ use ReflectionMethod;
  *   demoted master;
  * - no PhpRedisConnection method uses the client other than through command() unless the package's connection wraps
  *   it, or a failover there is not recovered;
- * - the hooks the connection overrides (retryOnceOnLostConnection(), rebuildClient()) are still what the methods
- *   around them call, and Connection::command(), which it calls directly to skip Laravel's retry, still only runs
- *   the command and dispatches its events; and every caller of retryOnceOnLostConnection() runs inside the package's
- *   retry loop, which is the only place that unwraps the UnretriedFailure it may throw;
+ * - Laravel's recovery hooks (retryOnceOnLostConnection(), rebuildClientOnLostConnection(), rebuildClient()) are
+ *   still called only from methods the connection replaces with its own (command(), pipeline(), transaction()), and
+ *   Connection::command(), which it calls directly to skip Laravel's retry, still only runs the command and
+ *   dispatches its events;
  * - createClient() and establishConnection() still send nothing to the server before the connector's own AUTH,
  *   SELECT and CLIENT SETNAME (it strips password, database and name first), and createClient() still applies
  *   max_retries right after connecting, which the connector's zero relies on;

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tgi\LaravelPhpRedisSentinel\Tests\Unit\Connections;
 
 use Closure;
+use LogicException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Redis;
@@ -365,6 +366,58 @@ final class OpenedByHandTest extends TestCase
         $this->assertSame(['multi', 'setex'], $client->sent());
         $this->assertSame(Redis::MULTI, $client->mode);
         $this->assertFalse($this->isStale($connection));
+    }
+
+    /**
+     * @return iterable<string, array{Closure(PhpRedisSentinelConnection, Closure): mixed, string}>
+     */
+    public static function callbackForms(): iterable
+    {
+        yield 'pipeline()' => [static fn (PhpRedisSentinelConnection $c, Closure $callback): mixed => $c->pipeline($callback), 'pipeline'];
+        yield 'transaction()' => [static fn (PhpRedisSentinelConnection $c, Closure $callback): mixed => $c->transaction($callback), 'multi'];
+    }
+
+    /**
+     * A callback that throws leaves nothing open: what it queued is discarded, and the next command runs at once.
+     *
+     * @param  Closure(PhpRedisSentinelConnection, Closure): mixed  $operation
+     */
+    #[DataProvider('callbackForms')]
+    public function test_a_callback_that_throws_leaves_nothing_open($operation, string $opens): void
+    {
+        $client = new LosingClient(null);
+        $connection = $this->connection($client, new LosingClient(null));
+        $failure = new LogicException('the callback failed');
+
+        $this->assertSame($failure, $this->thrownBy(fn () => $operation($connection, static function (object $opened) use ($failure): never {
+            $opened->set('k', 'v');
+
+            throw $failure;
+        })));
+        $this->assertSame([$opens, 'set', 'discard'], $client->sent());
+        $this->assertSame(Redis::ATOMIC, $client->mode);
+        $this->assertTrue($connection->get('k'), 'answered, not queued');
+        $this->assertSame([], $this->refreshes);
+        $this->assertSame([], $this->logger->warnings());
+    }
+
+    /**
+     * An error reply to a command queued in transaction()'s callback leaves the MULTI open on a live socket: it is
+     * discarded there before the transaction is replayed on the rediscovered master.
+     */
+    public function test_an_error_reply_inside_a_transaction_callback_is_discarded_before_the_replay(): void
+    {
+        $client = new LosingClient(new RedisException("READONLY You can't write against a read only replica."), 'set', errorReply: true);
+        $replacement = new LosingClient(null);
+        $connection = $this->connection($client, $replacement);
+
+        $connection->transaction(static fn (object $multi): mixed => $multi->set('k', 'v'));
+
+        $this->assertSame(['multi', 'set', 'discard'], $client->sent());
+        $this->assertSame(Redis::ATOMIC, $client->mode);
+        $this->assertSame(['multi', 'set', 'exec'], $replacement->sent());
+        $this->assertSame([true], $this->refreshes);
+        $this->assertCount(1, $this->logger->warnings());
     }
 
     /**

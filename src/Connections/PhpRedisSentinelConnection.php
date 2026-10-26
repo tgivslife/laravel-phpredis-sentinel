@@ -184,20 +184,22 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * {@inheritdoc}
      *
-     * A retry re-runs the whole pipeline.
+     * The package's own, not Laravel's, which retries opening and rebuilds the client from the cached address after
+     * a failed EXEC: its recovery hooks are never reached. A retry re-runs the whole pipeline.
      *
      * @return Redis|array<array-key, mixed>
      */
     #[\Override]
     public function pipeline(?callable $callback = null)
     {
-        return $this->retryOnFailure(fn () => parent::pipeline($callback));
+        return $this->retryOnFailure(fn () => $this->runOpened($this->client->pipeline(), $callback));
     }
 
     /**
      * {@inheritdoc}
      *
-     * With a callback, the transaction ends in EXEC or DISCARD, and so does any WATCH before it.
+     * The package's own, not Laravel's, as pipeline() is. With a callback, the transaction ends in EXEC or DISCARD,
+     * and so does any WATCH before it.
      *
      * @return Redis|array<array-key, mixed>
      */
@@ -205,7 +207,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     public function transaction(?callable $callback = null)
     {
         try {
-            return $this->retryOnFailure(fn () => parent::transaction($callback), opensTransaction: true);
+            return $this->retryOnFailure(fn () => $this->runOpened($this->openTransaction(), $callback), opensTransaction: true);
         } finally {
             if ($callback !== null) {
                 $this->watching = false;
@@ -280,20 +282,18 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * {@inheritdoc}
-     *
-     * Runs the callback once. Laravel retries opening a pipeline or transaction on a client rebuilt from the cached
-     * address; inside retryOnFailure() that would nest a second loop that never rediscovers the master.
+     * Open transaction()'s MULTI, which phpredis sends at once.
      *
      * A MULTI that fails to open because a WATCH was lost with the connection is let through: retrying it would open
      * the transaction on a client that watches nothing. This catches a WATCH sent on the client itself, which the
      * connection does not see.
+     *
+     * @return Redis
      */
-    #[\Override]
-    protected function retryOnceOnLostConnection(Closure $callback)
+    private function openTransaction()
     {
         try {
-            return $callback();
+            return $this->client->multi();
         } catch (Throwable $exception) {
             if (self::lostWatch($exception) && $this->retryPolicy->isRetryable($exception)) {
                 $this->abandonClient();
@@ -306,14 +306,30 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * {@inheritdoc}
+     * Run the callback on a pipeline or transaction just opened, then send it; without a callback, hand it back open.
      *
-     * Does nothing: Laravel rebuilds from the cached address; here only refreshClient() replaces the client.
+     * A failure discards what is still queued, so the client is not left in the pipeline or transaction, and is
+     * raised for the retry loop to judge. Discarding is best-effort: the socket may be gone.
+     *
+     * @param  Redis  $opened  What pipeline() or multi() handed back, in phpredis the client itself; untyped, as the
+     *                         client is.
+     * @return Redis|array<array-key, mixed>
      */
-    #[\Override]
-    protected function rebuildClient()
+    private function runOpened($opened, ?callable $callback)
     {
-        //
+        if ($callback === null) {
+            return $opened;
+        }
+
+        try {
+            $callback($opened);
+
+            return $opened->exec();
+        } catch (Throwable $exception) {
+            self::bestEffort(fn () => $this->client->discard());
+
+            throw $exception;
+        }
     }
 
     /**
