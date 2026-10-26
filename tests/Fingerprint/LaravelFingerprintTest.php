@@ -15,12 +15,13 @@ use ReflectionMethod;
 /**
  * The Laravel code the package depends on, fingerprinted as reviewed: any change to it fails here until reviewed.
  *
- * The package overrides protected methods of PhpRedisConnection, builds its data-node clients through
- * PhpRedisConnector::createClient(), and registers with the RedisManager, none of which Laravel documents. Every
- * public and protected method of PhpRedisConnection, of its parent Connection (those it overrides included) and of
- * PhpRedisConnector, traits' included, and the RedisManager methods the provider relies on, is hashed over its tokens
- * without whitespace or comments, so a reformat passes and any other change, a refactor included, fails with the
- * method it touched.
+ * The package's connection extends PhpRedisConnection, runs Laravel's scans and subscriptions inside its retry
+ * loop, calls Connection::command() directly, and relies on Laravel's recovery hooks being reached only from the
+ * methods it replaces; its connector builds data-node clients through PhpRedisConnector::createClient(), and the
+ * provider registers with the RedisManager, none of which Laravel documents. Every public and protected method of
+ * PhpRedisConnection, of its parent Connection (those it overrides included) and of PhpRedisConnector, traits'
+ * included, and the RedisManager methods the provider relies on, is hashed over its tokens without whitespace or
+ * comments, so a reformat passes and any other change, a refactor included, fails with the method it touched.
  *
  * This suite is left out of the default run: CI runs it against the newest Laravel and turns its failure into a
  * warning, and `composer test:fingerprint` runs it by hand. The package keeps working on a release it was not

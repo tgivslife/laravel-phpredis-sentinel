@@ -282,7 +282,7 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     }
 
     /**
-     * Open transaction()'s MULTI, which phpredis sends at once.
+     * Open transaction()'s MULTI, which phpredis sends at once, or only queues inside a pipeline.
      *
      * A MULTI that fails to open because a WATCH was lost with the connection is let through: retrying it would open
      * the transaction on a client that watches nothing. This catches a WATCH sent on the client itself, which the

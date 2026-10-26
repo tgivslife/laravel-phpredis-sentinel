@@ -250,11 +250,6 @@ final class PhpRedisSentinelConnectionTest extends TestCase
                 };
             }
 
-            public function discard(): void
-            {
-                // Laravel's pipeline() discards after a failed exec(); this pipeline queued nothing to drop.
-            }
-
             public function getMode(): int
             {
                 return Redis::ATOMIC;
