@@ -174,6 +174,55 @@ final class ControlledFailoverTest extends IntegrationTestCase
         $this->assertSame(['command', 'pipeline', 'transaction'], Servers::node($master)->mget(['after', 'piped', 'transacted']));
     }
 
+    /**
+     * The master hangs and the sentinels move on. A held pipeline and a held transaction fail at EXEC on a read
+     * timeout, which leaves their clients disconnected rather than failed: phpredis would reconnect them to the hung
+     * old master on their next call, and with a database to SELECT, as Laravel's cache connection has, wait out
+     * another read timeout there. Each recovers after one read timeout and the retry delay, as a command does.
+     */
+    public function test_a_held_pipeline_and_transaction_on_a_hung_master_recover_without_going_back_to_it(): void
+    {
+        $pipeline = $this->sentinelConnection(['database' => 1]);
+        $transaction = $this->sentinelConnection(['database' => 1]);
+
+        foreach ([$pipeline, $transaction] as $connection) {
+            $this->assertTrue($connection->ping(), 'held: open on the old master');
+        }
+
+        Servers::pause(Servers::MASTER);
+
+        try {
+            $master = Servers::failover();
+
+            $started = hrtime(true);
+            $piped = $pipeline->pipeline(fn (Redis $pipe): mixed => $pipe->set('piped', 'pipeline'));
+            $pipelineSeconds = (hrtime(true) - $started) / 1e9;
+
+            $started = hrtime(true);
+            $transacted = $transaction->transaction(fn (Redis $multi): mixed => $multi->set('transacted', 'transaction'));
+            $transactionSeconds = (hrtime(true) - $started) / 1e9;
+        } finally {
+            Servers::unpause(Servers::MASTER);
+        }
+
+        $this->assertSame([true], $piped);
+        $this->assertSame([true], $transacted);
+
+        // The default read timeout (2 s) and retry delay (0.5 s); a DISCARD sent to the hung master would add 2 s.
+        $this->assertLessThan(3.5, $pipelineSeconds);
+        $this->assertLessThan(3.5, $transactionSeconds);
+
+        $this->assertCount(2, $this->logger->warnings());
+
+        foreach ($this->logger->warnings() as $warning) {
+            $this->assertMatchesRegularExpression('/read error on connection|socket error on read socket/', $warning);
+        }
+
+        $this->assertSame($master, $pipeline->client()->getPort());
+        $this->assertSame($master, $transaction->client()->getPort());
+        $this->assertSame(['pipeline', 'transaction'], $pipeline->mget(['piped', 'transacted']));
+    }
+
     public function test_scans_interrupted_by_a_failover_return_every_key_at_least_once(): void
     {
         $scanning = $this->sentinelConnection();

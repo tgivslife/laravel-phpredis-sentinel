@@ -308,8 +308,10 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
     /**
      * Run the callback on a pipeline or transaction just opened, then send it; without a callback, hand it back open.
      *
-     * A failure discards what is still queued, so the client is not left in the pipeline or transaction, and is
-     * raised for the retry loop to judge. Discarding is best-effort: the socket may be gone.
+     * A failure is raised for the retry loop to judge. One that leaves the pipeline or transaction open, a callback
+     * that throws or an error reply inside a MULTI, first discards what is still queued, best-effort, so the client
+     * is not left in it. A socket failure has ended it already, and is not discarded: after a read error phpredis
+     * would reconnect to the client's address, after a failover the old master, and send its AUTH and SELECT there.
      *
      * @param  Redis  $opened  What pipeline() or multi() handed back, in phpredis the client itself; untyped, as the
      *                         client is.
@@ -326,7 +328,9 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
             return $opened->exec();
         } catch (Throwable $exception) {
-            self::bestEffort(fn () => $this->client->discard());
+            if ($this->client->getMode() !== Redis::ATOMIC) {
+                self::bestEffort(fn () => $this->client->discard());
+            }
 
             throw $exception;
         }

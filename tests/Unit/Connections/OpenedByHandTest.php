@@ -421,6 +421,27 @@ final class OpenedByHandTest extends TestCase
     }
 
     /**
+     * A socket lost at EXEC has ended the pipeline or transaction already, and after a read error phpredis would
+     * reconnect to the old master to run a DISCARD: the retry rediscovers without another call on that client.
+     *
+     * @param  Closure(PhpRedisSentinelConnection, Closure): mixed  $operation
+     */
+    #[DataProvider('callbackForms')]
+    public function test_nothing_is_sent_to_a_socket_lost_at_exec($operation, string $opens): void
+    {
+        $client = new LosingClient(new RedisException('read error on connection to 127.0.0.1:6390'), 'exec');
+        $replacement = new LosingClient(null);
+        $connection = $this->connection($client, $replacement);
+
+        $this->assertNull($this->thrownBy(fn () => $operation($connection, static fn (object $opened): mixed => $opened->set('k', 'v'))));
+        $this->assertSame([$opens, 'set', 'exec'], $client->sent(), 'no DISCARD');
+        $this->assertFalse($client->connected);
+        $this->assertSame([$opens, 'set', 'exec'], $replacement->sent());
+        $this->assertSame([true], $this->refreshes);
+        $this->assertCount(1, $this->logger->warnings());
+    }
+
+    /**
      * A connection whose connector records its refresh flags and hands back the replacement.
      */
     private function connection(LosingClient $client, LosingClient $replacement): PhpRedisSentinelConnection
