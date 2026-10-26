@@ -309,11 +309,12 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
      * Run the callback on a pipeline or transaction just opened, then send it; without a callback, hand it back open.
      *
      * A failure is raised for the retry loop to judge. One that leaves the pipeline or transaction open, a callback
-     * that throws or an error reply inside a MULTI, first discards what is still queued, best-effort, so the client
-     * is not left in it. For a transaction nested in a pipeline that is the whole outer pipeline, which phpredis
-     * drops with it, as under Laravel's transaction(). A socket failure has ended it already, and is not discarded:
-     * after a read error phpredis would reconnect to the client's address, after a failover the old master, and send
-     * its AUTH and SELECT there.
+     * that throws or an error reply inside a MULTI, first discards what pipeline() or multi() opened, best-effort, so
+     * it is not left open: on the client they were called on, not whichever one the connection holds by then, since a
+     * callback that carries on after a failed call gets a rebuilt client. For a transaction nested in a pipeline that
+     * is the whole outer pipeline, which phpredis drops with it, as under Laravel's transaction(). A socket failure
+     * has ended it already, and is not discarded: after a read error phpredis would reconnect to the client's
+     * address, after a failover the old master, and send its AUTH and SELECT there.
      *
      * @param  Redis  $opened  What pipeline() or multi() handed back, in phpredis the client itself; untyped, as the
      *                         client is.
@@ -330,8 +331,8 @@ final class PhpRedisSentinelConnection extends PhpRedisConnection
 
             return $opened->exec();
         } catch (Throwable $exception) {
-            if ($this->client->getMode() !== Redis::ATOMIC) {
-                self::bestEffort(fn () => $this->client->discard());
+            if ($opened->getMode() !== Redis::ATOMIC) {
+                self::bestEffort(fn () => $opened->discard());
             }
 
             throw $exception;

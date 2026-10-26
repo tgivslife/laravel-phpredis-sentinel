@@ -466,6 +466,36 @@ final class OpenedByHandTest extends TestCase
     }
 
     /**
+     * A callback that catches a failed call through the connection and carries on gets a rebuilt client on its next
+     * call. A failure then discards what transaction() opened, on the old client, which giving it up has ended
+     * already, not a pipeline the callback opened by hand on the rebuilt one: that is left to the callback, as any
+     * pipeline opened by hand is.
+     */
+    public function test_a_failed_callback_discards_what_was_opened_for_it_not_the_client_rebuilt_inside_it(): void
+    {
+        $client = new LosingClient(new RedisException("READONLY You can't write against a read only replica."), 'set', errorReply: true);
+        $replacement = new LosingClient(null);
+        $connection = $this->connection($client, $replacement);
+        $failure = new LogicException('the callback failed');
+
+        $this->assertSame($failure, $this->thrownBy(fn () => $connection->transaction(static function () use ($connection, $failure): never {
+            try {
+                $connection->set('k', 'v');
+            } catch (RedisException) {
+                // Carried on, on a client rebuilt by the next call.
+            }
+
+            $connection->pipeline();
+
+            throw $failure;
+        })));
+        $this->assertSame([true], $this->refreshes, 'rebuilt inside the callback');
+        $this->assertSame(['multi', 'set', 'discard'], $client->sent(), 'one DISCARD, from giving the old client up');
+        $this->assertSame(['pipeline'], $replacement->sent(), 'nothing discarded on the rebuilt client');
+        $this->assertSame(Redis::PIPELINE, $replacement->mode);
+    }
+
+    /**
      * A connection whose connector records its refresh flags and hands back the replacement.
      */
     private function connection(LosingClient $client, LosingClient $replacement): PhpRedisSentinelConnection

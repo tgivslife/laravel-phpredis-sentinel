@@ -247,6 +247,12 @@ final class PhpRedisSentinelConnectionTest extends TestCase
 
                         return [1, 1];
                     }
+
+                    public function getMode(): int
+                    {
+                        // Asked only after exec() failed: a lost connection, which ends the pipeline.
+                        return Redis::ATOMIC;
+                    }
                 };
             }
 
